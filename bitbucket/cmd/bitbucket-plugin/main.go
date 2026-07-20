@@ -24,7 +24,7 @@ func logDebug(format string, args ...interface{}) {
 
 const (
 	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.0"
+	pluginVersion   = "0.1.1"
 	cloudAPIBase    = "https://api.bitbucket.org/2.0"
 	cloudWebBase    = "https://bitbucket.org"
 )
@@ -940,7 +940,7 @@ func (p *bitbucketPlugin) doAPI(method, urlStr string) (*http.Response, error) {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "smuler-bitbucket-plugin/0.1.0")
+	req.Header.Set("User-Agent", "smuler-bitbucket-plugin/0.1.1")
 	p.auth.apply(req)
 	return p.client.Do(req)
 }

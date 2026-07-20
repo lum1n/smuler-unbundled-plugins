@@ -1,0 +1,4 @@
+.build/
+**/.smuler/
+**/*.tar.gz
+**/registry-entry.json

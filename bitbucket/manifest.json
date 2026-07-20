@@ -1,7 +1,7 @@
 {
   "id": "bitbucket",
   "name": "Bitbucket",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pull requests, review requests, and pipeline status from Bitbucket Cloud",
   "icon": {
     "type": "sfSymbol",
@@ -163,9 +163,9 @@
     {
       "id": "bitbucket-browser",
       "storageProviderId": "bitbucket",
-      "displayName": "Browser Session",
+      "displayName": "Cookie Auth",
       "authKind": "browser_import",
-      "description": "Import a signed-in browser session. Sign in, wait for the page to load, then close the window.",
+      "description": "Import a signed-in browser session cookie. Sign in, wait for the page to load, then close the window. Required for Bitbucket Server; also works for Bitbucket Cloud.",
       "deepLink": "https://bitbucket.org/dashboard/workspaces",
       "showEnableToggle": false,
       "allowMultipleAccounts": false,

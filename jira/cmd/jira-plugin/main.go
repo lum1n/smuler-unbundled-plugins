@@ -24,7 +24,7 @@ func logDebug(format string, args ...interface{}) {
 
 const (
 	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.0"
+	pluginVersion   = "0.1.1"
 )
 
 type apiHTTPError struct {
