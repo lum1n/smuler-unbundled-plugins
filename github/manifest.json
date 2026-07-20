@@ -1,0 +1,51 @@
+{
+  "id": "github",
+  "name": "GitHub",
+  "version": "0.1.0",
+  "description": "GitHub reviews, pull requests, and notifications",
+  "icon": {
+    "type": "sfSymbol",
+    "value": "arrow.triangle.pull"
+  },
+  "executable": "bin/github-plugin",
+  "capabilities": [
+    "summary",
+    "items",
+    "actions",
+    "alerts"
+  ],
+  "domains": [
+    "pr"
+  ],
+  "authRequirements": [
+    "oauth"
+  ],
+  "minimumHostVersion": "0.1.0",
+  "permissions": [
+    "network",
+    "background_refresh",
+    "notifications"
+  ],
+  "notificationEvents": [
+    {
+      "type": "pr.review_requested",
+      "title": "Review Requested",
+      "description": "A new pull request review is requested from you"
+    },
+    {
+      "type": "pr.review_completed",
+      "title": "Review Completed",
+      "description": "A review you were requested on was completed"
+    },
+    {
+      "type": "pr.count_increased",
+      "title": "Review Backlog Grew",
+      "description": "The number of pending review requests increased"
+    },
+    {
+      "type": "pr.count_decreased",
+      "title": "Review Backlog Shrunk",
+      "description": "The number of pending review requests decreased"
+    }
+  ]
+}

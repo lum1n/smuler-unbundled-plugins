@@ -1,0 +1,64 @@
+{
+  "id": "agent-monitor",
+  "name": "Agent Monitor",
+  "version": "0.1.0",
+  "description": "Monitors AI coding agents (Claude Code, Codex, OpenCode, Pi, Aider, Archer) from local process and session state, with native hook integration for tool-level status",
+  "icon": {
+    "type": "sfSymbol",
+    "value": "cpu"
+  },
+  "executable": "bin/agent-monitor-plugin",
+  "capabilities": [
+    "summary",
+    "items",
+    "alerts"
+  ],
+  "domains": [
+    "agent"
+  ],
+  "authRequirements": [
+    "none"
+  ],
+  "minimumHostVersion": "0.1.0",
+  "permissions": [
+    "notifications",
+    "background_refresh"
+  ],
+  "shellIntegration": {
+    "zsh": "hooks/agent-hook.zsh",
+    "bash": "hooks/agent-hook.bash",
+    "fish": "hooks/agent-hook.fish"
+  },
+  "claudeHooks": {
+    "description": "Registers Claude Code lifecycle hooks (PreToolUse, PostToolUse, UserPromptSubmit, PermissionRequest, Stop) for granular status tracking",
+    "configPath": "~/.claude/settings.json",
+    "hookScript": "~/.cache/smuler/claude-hook.js",
+    "backupPath": "~/.claude/settings.json.bak-smuler"
+  },
+  "notificationEvents": [
+    {
+      "type": "agent_question",
+      "title": "Agent needs input",
+      "description": "When an agent pauses to ask you a question"
+    },
+    {
+      "type": "agent_completed",
+      "title": "Agent finished",
+      "description": "When an agent completes a task successfully"
+    },
+    {
+      "type": "agent_error",
+      "title": "Agent failed",
+      "description": "When an agent exits with an error"
+    }
+  ],
+  "settings": [
+    {
+      "key": "agent.pollInterval",
+      "label": "Process scan interval (seconds)",
+      "type": "int",
+      "default": "5",
+      "help": "How often to scan /proc for agent processes."
+    }
+  ]
+}

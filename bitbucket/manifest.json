@@ -1,0 +1,177 @@
+{
+  "id": "bitbucket",
+  "name": "Bitbucket",
+  "version": "0.1.0",
+  "description": "Pull requests, review requests, and pipeline status from Bitbucket Cloud",
+  "icon": {
+    "type": "sfSymbol",
+    "value": "arrow.triangle.pull"
+  },
+  "executable": "bin/bitbucket-plugin",
+  "capabilities": [
+    "summary",
+    "items",
+    "alerts"
+  ],
+  "domains": [
+    "pr",
+    "ci"
+  ],
+  "authRequirements": [
+    "oauth",
+    "api_key",
+    "browser_import"
+  ],
+  "minimumHostVersion": "0.1.0",
+  "permissions": [
+    "network",
+    "background_refresh",
+    "notifications"
+  ],
+  "oauth": {
+    "authorizeURL": "https://bitbucket.org/site/oauth2/authorize",
+    "tokenURL": "https://bitbucket.org/site/oauth2/access_token",
+    "clientId": "smuler-bitbucket",
+    "scopes": [
+      "pullrequest",
+      "repository",
+      "pipeline",
+      "account"
+    ]
+  },
+  "notificationEvents": [
+    {
+      "type": "pr.created",
+      "title": "New pull request",
+      "description": "A new pull request was opened that involves you."
+    },
+    {
+      "type": "pr.merged",
+      "title": "PR merged",
+      "description": "A tracked pull request was merged or closed."
+    },
+    {
+      "type": "pr.declined",
+      "title": "PR declined",
+      "description": "A tracked pull request was declined."
+    },
+    {
+      "type": "pr.status_failed",
+      "title": "Build failed",
+      "description": "A pipeline or build status on a tracked PR failed."
+    }
+  ],
+  "settings": [
+    {
+      "key": "bitbucket.workspace",
+      "label": "Workspace",
+      "type": "string",
+      "default": "",
+      "placeholder": "your-workspace"
+    },
+    {
+      "key": "bitbucket.serverUrl",
+      "label": "Server URL",
+      "type": "string",
+      "default": "",
+      "placeholder": "https://bitbucket.example.com"
+    },
+    {
+      "key": "bitbucket.showMyPRs",
+      "label": "Show my PRs",
+      "type": "bool",
+      "default": "true"
+    },
+    {
+      "key": "bitbucket.showReviewRequests",
+      "label": "Show review requests",
+      "type": "bool",
+      "default": "true"
+    },
+    {
+      "key": "bitbucket.showPipelines",
+      "label": "Show pipelines",
+      "type": "bool",
+      "default": "true"
+    },
+    {
+      "key": "bitbucket.maxPRs",
+      "label": "Max PRs",
+      "type": "int",
+      "default": "10"
+    },
+    {
+      "key": "bitbucket.excludedUsers",
+      "label": "Excluded users",
+      "type": "string",
+      "default": "",
+      "placeholder": "bot-user,ci-user",
+      "help": "Comma-separated usernames to exclude from review lists."
+    }
+  ],
+  "lookupActions": [
+    {
+      "kind": "prNumber",
+      "actionId": "searchPRs",
+      "payloadKey": "query",
+      "queryTemplate": "#{value}",
+      "matchPattern": "\\b(?:(?:PR|pull request)\\s*)?#(\\d+)\\b",
+      "labelTemplate": "Search PR #{value}"
+    },
+    {
+      "kind": "prQuery",
+      "actionId": "searchPRs",
+      "payloadKey": "query",
+      "labelTemplate": "Search PRs for \"{value}\""
+    }
+  ],
+  "authProviders": [
+    {
+      "id": "bitbucket-api",
+      "storageProviderId": "bitbucket",
+      "displayName": "App Password",
+      "authKind": "api_key",
+      "description": "Create an app password at bitbucket.org/account/settings/app-passwords with pullrequest:read, repository:read, and pipeline:read scopes.",
+      "showEnableToggle": false,
+      "allowMultipleAccounts": false,
+      "apiKeyFormat": "username:password",
+      "usernamePlaceholder": "Bitbucket username",
+      "passwordPlaceholder": "App password"
+    },
+    {
+      "id": "bitbucket-oauth",
+      "storageProviderId": "bitbucket",
+      "displayName": "OAuth",
+      "authKind": "oauth",
+      "description": "Sign in with Bitbucket Cloud OAuth. Grants read access to pull requests, repositories, and pipelines.",
+      "connectLabel": "Connect with Bitbucket",
+      "showEnableToggle": false,
+      "allowMultipleAccounts": false,
+      "hideWhenSettingNonEmpty": "bitbucket.serverUrl",
+      "oauth": {
+        "authorizeURL": "https://bitbucket.org/site/oauth2/authorize",
+        "tokenURL": "https://bitbucket.org/site/oauth2/access_token",
+        "clientId": "smuler-bitbucket",
+        "scopes": [
+          "pullrequest",
+          "repository",
+          "pipeline",
+          "account"
+        ]
+      }
+    },
+    {
+      "id": "bitbucket-browser",
+      "storageProviderId": "bitbucket",
+      "displayName": "Browser Session",
+      "authKind": "browser_import",
+      "description": "Import a signed-in browser session. Sign in, wait for the page to load, then close the window.",
+      "deepLink": "https://bitbucket.org/dashboard/workspaces",
+      "showEnableToggle": false,
+      "allowMultipleAccounts": false,
+      "fixedAccountId": "_browser",
+      "importURLFromSetting": "bitbucket.serverUrl",
+      "importURLTemplate": "{value}/dashboard/workspaces"
+    }
+  ]
+}

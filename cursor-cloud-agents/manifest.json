@@ -1,0 +1,50 @@
+{
+  "id": "cursor-cloud-agents",
+  "name": "Cursor Cloud Agents",
+  "version": "0.1.0",
+  "description": "Monitor Cursor cloud agents — status, repos, runs, PRs, and token usage",
+  "executable": "bin/cursor-cloud-agents-plugin",
+  "icon": { "type": "sfSymbol", "value": "cloud" },
+  "language": "go",
+  "capabilities": ["summary", "items", "actions", "alerts"],
+  "domains": ["agent"],
+  "authRequirements": ["api_key"],
+  "minimumHostVersion": "0.1.0",
+  "permissions": ["network", "background_refresh", "notifications"],
+  "notificationEvents": [
+    { "type": "agent.run_finished", "title": "Agent Finished", "description": "A cloud agent run completed" },
+    { "type": "agent.run_error", "title": "Agent Error", "description": "A cloud agent run failed" },
+    { "type": "agent.started", "title": "Agent Running", "description": "A cloud agent started running" }
+  ],
+  "settings": [
+    {
+      "key": "cursor-cloud-agents.refreshSeconds",
+      "label": "Refresh interval (seconds)",
+      "type": "int",
+      "default": "60",
+      "help": "How often to poll the Cursor Cloud Agents API."
+    },
+    {
+      "key": "cursor-cloud-agents.maxAgents",
+      "label": "Max agents shown",
+      "type": "int",
+      "default": "20",
+      "help": "Maximum number of agents to show as items. Summary counts include all agents."
+    },
+    {
+      "key": "cursor-cloud-agents.includeArchived",
+      "label": "Include archived agents",
+      "type": "bool",
+      "default": "false",
+      "help": "Include archived agents when listing."
+    },
+    {
+      "key": "cursor-cloud-agents.detailLevel",
+      "label": "Detail level",
+      "type": "choice",
+      "choices": ["summary", "full"],
+      "default": "full",
+      "help": "Full fetches per-agent details, latest run, and token usage for displayed agents."
+    }
+  ]
+}

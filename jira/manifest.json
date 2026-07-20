@@ -1,0 +1,112 @@
+{
+  "id": "jira",
+  "name": "Jira",
+  "version": "0.1.0",
+  "description": "Assigned issues and workflow signals from Jira",
+  "icon": {
+    "type": "sfSymbol",
+    "value": "tray.full"
+  },
+  "executable": "bin/jira-plugin",
+  "capabilities": [
+    "summary",
+    "items",
+    "alerts"
+  ],
+  "domains": [
+    "issues"
+  ],
+  "authRequirements": [
+    "browser_import"
+  ],
+  "minimumHostVersion": "0.1.0",
+  "permissions": [
+    "network",
+    "background_refresh",
+    "notifications"
+  ],
+  "notificationEvents": [
+    {
+      "type": "issue.created",
+      "title": "New issue",
+      "description": "Assigned, watching, or mentioned issues newly appearing in Jira."
+    },
+    {
+      "type": "issue.resolved",
+      "title": "Issue resolved",
+      "description": "An issue disappeared from the active set because it was resolved or moved."
+    },
+    {
+      "type": "issue.overdue",
+      "title": "Overdue issue",
+      "description": "The overdue issue count increased and needs attention."
+    }
+  ],
+  "settings": [
+    {
+      "key": "jira.domain",
+      "label": "Jira domain",
+      "type": "string",
+      "default": "",
+      "placeholder": "https://your-domain.atlassian.net",
+      "help": "Your Jira Cloud base URL used for browser session import."
+    },
+    {
+      "key": "jira.showAssigned",
+      "label": "Show assigned issues",
+      "type": "bool",
+      "default": "true"
+    },
+    {
+      "key": "jira.showWatching",
+      "label": "Show watching",
+      "type": "bool",
+      "default": "false"
+    },
+    {
+      "key": "jira.showMentions",
+      "label": "Show mentions",
+      "type": "bool",
+      "default": "false"
+    },
+    {
+      "key": "jira.showSprint",
+      "label": "Show current sprint",
+      "type": "bool",
+      "default": "false"
+    },
+    {
+      "key": "jira.jql",
+      "label": "Custom JQL",
+      "type": "string",
+      "default": "",
+      "placeholder": "project = PROJ AND priority = High"
+    },
+    {
+      "key": "jira.maxIssues",
+      "label": "Max issues",
+      "type": "int",
+      "default": "10"
+    }
+  ],
+  "lookupActions": [
+    {
+      "kind": "issueKey",
+      "actionId": "getIssueDetails",
+      "payloadKey": "key",
+      "matchPattern": "\\b[A-Z][A-Z0-9_]+-\\d+\\b",
+      "labelTemplate": "Fetch issue {value}"
+    }
+  ],
+  "authProviders": [
+    {
+      "id": "jira",
+      "displayName": "Browser Session",
+      "authKind": "browser_import",
+      "description": "Import a signed-in browser session for your Jira domain. Set the domain above first.",
+      "showEnableToggle": false,
+      "allowMultipleAccounts": false,
+      "importURLFromSetting": "jira.domain"
+    }
+  ]
+}

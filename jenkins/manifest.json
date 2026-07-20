@@ -1,0 +1,24 @@
+{
+  "id": "jenkins",
+  "name": "Jenkins",
+  "version": "0.1.0",
+  "description": "CI build health for Jenkins jobs",
+  "executable": "bin/jenkins-plugin",
+  "capabilities": ["summary", "items", "actions", "alerts"],
+  "domains": ["ci"],
+  "authRequirements": ["none"],
+  "minimumHostVersion": "0.1.0",
+  "permissions": ["network", "background_refresh", "notifications"],
+  "notificationEvents": [
+    { "type": "build.failed", "title": "Build Failed", "description": "A Jenkins job build has failed" },
+    { "type": "build.fixed", "title": "Build Fixed", "description": "A previously failing Jenkins job is passing again" },
+    { "type": "failure.count_increased", "title": "Failures Increased", "description": "The number of failing jobs increased" },
+    { "type": "failure.count_decreased", "title": "Failures Decreased", "description": "The number of failing jobs decreased" }
+  ],
+  "settings": [
+    { "key": "jenkins.url", "label": "Jenkins URL", "type": "string", "default": "", "placeholder": "https://jenkins.example.com", "help": "Root URL of the Jenkins server." },
+    { "key": "jenkins.user", "label": "Username", "type": "string", "default": "", "placeholder": "your-username", "help": "Jenkins user for basic auth." },
+    { "key": "jenkins.token", "label": "API Token", "type": "string", "default": "", "placeholder": "your-api-token", "help": "Jenkins API token. Generate at {jenkins.url}/user/{user}/configure > API Token." },
+    { "key": "jenkins.jobFilter", "label": "Job filter (regex)", "type": "string", "default": "", "placeholder": ".*-prod|^api-.*", "help": "Optional regex to filter job names. Leave blank to show all." }
+  ]
+}

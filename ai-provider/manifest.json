@@ -1,0 +1,267 @@
+{
+  "id": "ai-provider",
+  "name": "AI Providers",
+  "version": "0.1.0",
+  "description": "Usage limits and quota tracking for AI coding providers",
+  "icon": {
+    "type": "sfSymbol",
+    "value": "brain.head.profile"
+  },
+  "domains": [
+    "ai"
+  ],
+  "executable": "bin/ai-provider-plugin",
+  "capabilities": [
+    "summary",
+    "items",
+    "actions",
+    "alerts"
+  ],
+  "authRequirements": [
+    "oauth",
+    "api_key",
+    "web_session",
+    "browser_import",
+    "local_only"
+  ],
+  "minimumHostVersion": "0.1.0",
+  "permissions": [
+    "network",
+    "background_refresh",
+    "notifications"
+  ],
+  "notificationEvents": [
+    {
+      "type": "usage.threshold_crossed",
+      "title": "Threshold crossed",
+      "description": "Usage crossed a warning or critical threshold."
+    },
+    {
+      "type": "usage.decreased",
+      "title": "Usage decreased",
+      "description": "Usage dropped materially from the prior reading."
+    },
+    {
+      "type": "usage.increased",
+      "title": "Usage increased",
+      "description": "Usage rose materially while still below warning threshold."
+    }
+  ],
+  "authProviders": [
+    {
+      "id": "openrouter",
+      "displayName": "OpenRouter",
+      "authKind": "api_key",
+      "description": "Paste your OpenRouter API key to track credit usage.",
+      "deepLink": "https://openrouter.ai/keys",
+      "defaultEnabled": false
+    },
+    {
+      "id": "claude",
+      "displayName": "Claude",
+      "authKind": "oauth",
+      "description": "Sign in with Anthropic to track Claude usage limits and reset times.",
+      "deepLink": "https://console.anthropic.com/settings/usage",
+      "oauth": {
+        "authorizeURL": "https://console.anthropic.com/oauth/authorize",
+        "tokenURL": "https://api.anthropic.com/oauth/token",
+        "clientId": "smuler-claude",
+        "scopes": [
+          "usage:read"
+        ]
+      },
+      "defaultEnabled": false
+    },
+    {
+      "id": "codex",
+      "displayName": "Codex",
+      "authKind": "oauth",
+      "description": "Sign in with OpenAI to track Codex quota usage.",
+      "deepLink": "https://platform.openai.com/account/usage",
+      "oauth": {
+        "authorizeURL": "https://auth.openai.com/authorize",
+        "tokenURL": "https://auth.openai.com/token",
+        "clientId": "smuler-codex",
+        "scopes": [
+          "usage.read",
+          "organization.read"
+        ]
+      },
+      "defaultEnabled": false
+    },
+    {
+      "id": "opencode",
+      "displayName": "OpenCode",
+      "authKind": "browser_import",
+      "description": "Import your OpenCode browser session to track usage.",
+      "deepLink": "https://opencode.ai/usage",
+      "defaultEnabled": false
+    },
+    {
+      "id": "opencode-go",
+      "displayName": "OpenCode Go",
+      "authKind": "browser_import",
+      "description": "Track OpenCode Go workspace usage. Reuses OpenCode session.",
+      "deepLink": "https://opencode.ai/go/usage",
+      "defaultEnabled": false
+    },
+    {
+      "id": "copilot",
+      "displayName": "Copilot",
+      "authKind": "oauth",
+      "description": "Sign in with GitHub to track Copilot usage across personal and enterprise accounts.",
+      "deepLink": "https://github.com/settings/copilot",
+      "settingsPrefix": "copilot",
+      "connectLabel": "Connect with GitHub",
+      "oauth": {
+        "authorizeURL": "https://github.com/login/device",
+        "tokenURL": "https://github.com/login/oauth/access_token",
+        "clientId": "Iv1.b507a08c87ecfe98",
+        "scopes": [
+          "user"
+        ],
+        "deviceAuthorizationEndpoint": "https://github.com/login/device/code",
+        "enterprise": {
+          "deviceCodeURL": "https://{host}/login/device/code",
+          "tokenURL": "https://{host}/login/oauth/access_token",
+          "verificationURL": "https://{host}/login/device"
+        }
+      },
+      "defaultEnabled": false
+    },
+    {
+      "id": "cursor",
+      "displayName": "Cursor",
+      "authKind": "browser_import",
+      "description": "Import your Cursor browser session to track plan usage and billing cycle resets.",
+      "deepLink": "https://cursor.com/dashboard",
+      "defaultEnabled": false
+    },
+    {
+      "id": "commandcode",
+      "displayName": "Command Code",
+      "authKind": "browser_import",
+      "description": "Import your Command Code browser session to track monthly credit usage.",
+      "deepLink": "https://commandcode.ai/studio",
+      "defaultEnabled": false
+    },
+    {
+      "id": "gemini",
+      "displayName": "Gemini",
+      "authKind": "api_key",
+      "description": "Optional: paste an access token, or authenticate via `gemini` CLI (uses ~/.gemini/oauth_creds.json).",
+      "deepLink": "https://aistudio.google.com",
+      "defaultEnabled": false
+    },
+    {
+      "id": "windsurf",
+      "displayName": "Windsurf",
+      "authKind": "web_session",
+      "description": "Paste Windsurf session JSON from browser localStorage (devin_session_token, devin_auth1_token, etc.).",
+      "deepLink": "https://windsurf.com/profile",
+      "defaultEnabled": false
+    },
+    {
+      "id": "grok",
+      "displayName": "Grok",
+      "authKind": "browser_import",
+      "description": "Import your grok.com browser session or paste a bearer token to track credit usage.",
+      "deepLink": "https://grok.com",
+      "defaultEnabled": false
+    },
+    {
+      "id": "augment",
+      "displayName": "Augment",
+      "authKind": "browser_import",
+      "description": "Import your Augment browser session from app.augmentcode.com.",
+      "deepLink": "https://app.augmentcode.com",
+      "defaultEnabled": false
+    },
+    {
+      "id": "factory",
+      "displayName": "Factory",
+      "authKind": "browser_import",
+      "description": "Import your Factory browser session from app.factory.ai.",
+      "deepLink": "https://app.factory.ai",
+      "defaultEnabled": false
+    },
+    {
+      "id": "zed",
+      "displayName": "Zed",
+      "authKind": "api_key",
+      "description": "Paste your Zed access token from Keychain or Zed settings.",
+      "deepLink": "https://zed.dev",
+      "defaultEnabled": false
+    },
+    {
+      "id": "warp",
+      "displayName": "Warp",
+      "authKind": "api_key",
+      "description": "Paste your Warp API key to track request credit usage.",
+      "deepLink": "https://app.warp.dev",
+      "defaultEnabled": false
+    },
+    {
+      "id": "devin",
+      "displayName": "Devin",
+      "authKind": "api_key",
+      "description": "Paste a Devin bearer token. Set your org slug in plugin settings.",
+      "deepLink": "https://app.devin.ai",
+      "defaultEnabled": false
+    },
+    {
+      "id": "kiro",
+      "displayName": "Kiro",
+      "authKind": "local_only",
+      "description": "Uses local kiro-cli credentials. Run `kiro-cli login` \u2014 no host secret required.",
+      "deepLink": "https://kiro.dev",
+      "defaultEnabled": false
+    }
+  ],
+  "settings": [
+    {
+      "key": "ai-provider.warningThreshold",
+      "label": "Warning threshold (%)",
+      "type": "int",
+      "default": "75"
+    },
+    {
+      "key": "ai-provider.criticalThreshold",
+      "label": "Critical threshold (%)",
+      "type": "int",
+      "default": "90"
+    },
+    {
+      "key": "ai-provider.copilotAccountType",
+      "label": "Copilot account type",
+      "type": "choice",
+      "default": "personal",
+      "choices": [
+        "personal",
+        "enterprise"
+      ]
+    },
+    {
+      "key": "ai-provider.copilotOrgName",
+      "label": "GitHub org name (enterprise seat check)",
+      "type": "string",
+      "default": "",
+      "help": "GitHub org to check Copilot seat status in"
+    },
+    {
+      "key": "ai-provider.copilotEnterpriseHost",
+      "label": "Enterprise host",
+      "type": "string",
+      "default": "",
+      "placeholder": "github.mycompany.com",
+      "help": "GitHub Enterprise Server hostname. Leave empty to use github.com."
+    },
+    {
+      "key": "ai-provider.devinOrgName",
+      "label": "Devin org slug",
+      "type": "string",
+      "default": "",
+      "help": "Devin organization slug (e.g. my-org) or full org path from app.devin.ai"
+    }
+  ]
+}

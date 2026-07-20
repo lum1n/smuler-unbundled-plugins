@@ -1,0 +1,195 @@
+package internal
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ProcDetector scans the process table for known agent executables.
+type ProcDetector struct {
+	store    *AgentStore
+	execs    map[string]string
+	interval time.Duration
+	done     chan struct{}
+	tracked  map[string]bool
+}
+
+// NewProcDetector creates a process detector with the default agent registry.
+func NewProcDetector(store *AgentStore, interval time.Duration) *ProcDetector {
+	return &ProcDetector{
+		store: store,
+		execs: map[string]string{
+			"archer":   "archer",
+			"claude":   "claude",
+			"opencode": "opencode",
+			"codex":    "codex",
+			"pi":       "pi",
+			"aider":    "aider",
+		},
+		interval: interval,
+		done:     make(chan struct{}),
+		tracked:  make(map[string]bool),
+	}
+}
+
+// Start begins the polling loop.
+func (pd *ProcDetector) Start() { go pd.pollLoop() }
+
+// Stop terminates the polling loop.
+func (pd *ProcDetector) Stop() { close(pd.done) }
+
+func (pd *ProcDetector) pollLoop() {
+	ticker := time.NewTicker(pd.interval)
+	defer ticker.Stop()
+	pd.scan()
+	for {
+		select {
+		case <-ticker.C:
+			pd.scan()
+		case <-pd.done:
+			return
+		}
+	}
+}
+
+func (pd *ProcDetector) scan() {
+	seen := make(map[string]bool)
+
+	switch runtime.GOOS {
+	case "darwin":
+		pd.scanPS(seen)
+	case "linux":
+		pd.scanProc(seen)
+	}
+
+	for id := range pd.tracked {
+		if !seen[id] {
+			entry := pd.store.Get(id)
+			if entry != nil && entry.IsTerminalState() {
+				continue
+			}
+			pd.store.Remove(id)
+			delete(pd.tracked, id)
+		}
+	}
+
+	pd.store.RemoveCompletedOlderThan(time.Now().UnixMilli() - 60000)
+}
+
+func (pd *ProcDetector) matchAndRecord(args []string, pid int, ppid int, seen map[string]bool) {
+	if len(args) == 0 || args[0] == "" {
+		return
+	}
+	agentID, ok := pd.execs[strings.ToLower(filepath.Base(args[0]))]
+	if !ok {
+		return
+	}
+	id := agentID + "-" + strconv.Itoa(pid)
+
+	existing := pd.store.Get(id)
+	if existing != nil {
+		if existing.IsTerminalState() {
+			return
+		}
+		// Preserve hook/reader-derived state; only refresh PID if missing.
+		if existing.PID == 0 {
+			pd.store.Upsert(AgentSession{ID: id, AgentID: agentID, PID: pid})
+		}
+		seen[id] = true
+		pd.tracked[id] = true
+		return
+	}
+
+	if ppid > 0 {
+		hookID := agentID + "-" + strconv.Itoa(ppid)
+		if hookEntry := pd.store.Get(hookID); hookEntry != nil && !hookEntry.IsTerminalState() {
+			// Re-key shell-hook session to the real agent PID without resetting state.
+			if hookEntry.ID != id {
+				pd.store.Upsert(AgentSession{
+					ID:           id,
+					AgentID:      agentID,
+					DisplayName:  hookEntry.DisplayName,
+					Command:      hookEntry.Command,
+					State:        hookEntry.State,
+					Task:         hookEntry.Task,
+					QuestionText: hookEntry.QuestionText,
+					CurrentTool:  hookEntry.CurrentTool,
+					SessionID:    hookEntry.SessionID,
+					PID:          pid,
+				})
+				pd.store.Remove(hookEntry.ID)
+			}
+			seen[id] = true
+			pd.tracked[id] = true
+			return
+		}
+	}
+
+	seen[id] = true
+	pd.tracked[id] = true
+	pd.store.Upsert(AgentSession{
+		ID:      id,
+		AgentID: agentID,
+		Command: strings.Join(args, " "),
+		State:   "running",
+		PID:     pid,
+	})
+}
+
+func (pd *ProcDetector) scanPS(seen map[string]bool) {
+	out, err := exec.Command("ps", "-Ao", "pid=,ppid=,args=").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		ppid, err := strconv.Atoi(fields[1])
+		if err != nil {
+			ppid = 0
+		}
+		pd.matchAndRecord(fields[2:], pid, ppid, seen)
+	}
+}
+
+func (pd *ProcDetector) scanProc(seen map[string]bool) {
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+		ppid := 0
+		stat, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
+		if err == nil {
+			fields := strings.Fields(string(stat))
+			if len(fields) > 3 {
+				ppid, _ = strconv.Atoi(fields[3])
+			}
+		}
+		pd.matchAndRecord(args, pid, ppid, seen)
+	}
+}

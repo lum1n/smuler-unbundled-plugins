@@ -1,0 +1,80 @@
+{
+  "id": "email",
+  "name": "Email",
+  "version": "0.1.0",
+  "description": "Unread email count and recent messages from Gmail, Outlook, iCloud, and IMAP inboxes",
+  "icon": {
+    "type": "sfSymbol",
+    "value": "envelope"
+  },
+  "executable": "bin/email-plugin",
+  "domains": [
+    "mail"
+  ],
+  "capabilities": [
+    "summary",
+    "items",
+    "actions",
+    "alerts"
+  ],
+  "authRequirements": [
+    "api_key"
+  ],
+  "minimumHostVersion": "0.1.0",
+  "permissions": [
+    "network",
+    "background_refresh",
+    "notifications"
+  ],
+  "notificationEvents": [
+    {
+      "type": "email.new_message",
+      "title": "New Email",
+      "description": "You received a new email"
+    }
+  ],
+  "settings": [
+    {
+      "key": "email.provider",
+      "label": "Provider",
+      "type": "choice",
+      "choices": [
+        "gmail",
+        "outlook",
+        "icloud",
+        "imap"
+      ],
+      "default": "gmail"
+    },
+    {
+      "key": "email.username",
+      "label": "Email address",
+      "type": "string",
+      "placeholder": "user@example.com"
+    },
+    {
+      "key": "email.imapServer",
+      "label": "IMAP server (overrides default)",
+      "type": "string",
+      "placeholder": "imap.example.com"
+    },
+    {
+      "key": "email.imapPort",
+      "label": "IMAP port",
+      "type": "string",
+      "default": "993"
+    },
+    {
+      "key": "email.refreshSeconds",
+      "label": "Refresh interval (seconds)",
+      "type": "int",
+      "default": "60"
+    },
+    {
+      "key": "email.maxItems",
+      "label": "Max items shown",
+      "type": "int",
+      "default": "10"
+    }
+  ]
+}

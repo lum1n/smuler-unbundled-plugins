@@ -1,0 +1,31 @@
+{
+  "id": "teams",
+  "name": "Teams",
+  "version": "0.1.0",
+  "description": "Microsoft Teams mentions, meetings, and call awareness",
+  "executable": "bin/teams-plugin",
+  "capabilities": ["summary", "items", "actions", "alerts"],
+  "domains": ["calendar"],
+  "authRequirements": ["none"],
+  "minimumHostVersion": "0.1.0",
+  "permissions": ["network", "background_refresh"],
+  "notificationEvents": [
+    { "type": "mention.received", "title": "Mention Received", "description": "You were @mentioned in Teams" },
+    { "type": "meeting.started", "title": "Meeting Started", "description": "A Teams meeting has started" },
+    { "type": "call.incoming", "title": "Incoming Call", "description": "You have an incoming Teams call" }
+  ],
+  "settings": [
+    {
+      "key": "teams.maxLogLines",
+      "label": "Log lines to read",
+      "type": "int",
+      "default": "2000"
+    },
+    {
+      "key": "teams.refreshSeconds",
+      "label": "Refresh interval (seconds)",
+      "type": "int",
+      "default": "10"
+    }
+  ]
+}

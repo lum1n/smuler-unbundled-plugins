@@ -1,0 +1,74 @@
+{
+  "id": "linear",
+  "name": "Linear",
+  "version": "0.1.0",
+  "description": "Assigned issues and workflow signals from Linear",
+  "icon": {
+    "type": "sfSymbol",
+    "value": "circle.grid.2x2"
+  },
+  "executable": "bin/linear-plugin",
+  "capabilities": [
+    "summary",
+    "items",
+    "actions",
+    "alerts"
+  ],
+  "domains": [
+    "issues"
+  ],
+  "authRequirements": [
+    "oauth"
+  ],
+  "minimumHostVersion": "0.1.0",
+  "permissions": [
+    "network",
+    "background_refresh",
+    "notifications"
+  ],
+  "notificationEvents": [
+    {
+      "type": "issue.created",
+      "title": "New issue",
+      "description": "Assigned issues, mentions, or triage work newly appearing in Linear."
+    },
+    {
+      "type": "issue.resolved",
+      "title": "Issue resolved",
+      "description": "An issue disappeared from the active set because it was completed or moved."
+    },
+    {
+      "type": "issue.overdue",
+      "title": "Overdue issue",
+      "description": "The overdue issue count increased and needs attention."
+    }
+  ],
+  "settings": [
+    {
+      "key": "linear.showAssigned",
+      "label": "Show assigned issues",
+      "type": "bool",
+      "default": "true"
+    },
+    {
+      "key": "linear.showMentions",
+      "label": "Show mentions",
+      "type": "bool",
+      "default": "false"
+    },
+    {
+      "key": "linear.showTriage",
+      "label": "Show team triage",
+      "type": "bool",
+      "default": "false"
+    },
+    {
+      "key": "linear.teamIds",
+      "label": "Triage team IDs or keys",
+      "type": "string",
+      "default": "",
+      "placeholder": "platform,eng",
+      "help": "Comma-separated team keys or ids used when team triage is enabled."
+    }
+  ]
+}
