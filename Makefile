@@ -25,7 +25,7 @@ registry-plugins-install:
 #   make registry-plugins-publish PUBLISH_ARGS='--release --tag plugins-v0.1.0'
 #   make registry-plugins-publish PUBLISH_ARGS='--release --submit --tag plugins-v0.1.0'
 PUBLISH_ARGS ?=
-registry-plugins-publish: cli-build
+registry-plugins-publish:
 	@chmod +x "$(CURDIR)/publish-registry-plugins.sh"
 	@"$(CURDIR)/publish-registry-plugins.sh" $(PUBLISH_ARGS)
 

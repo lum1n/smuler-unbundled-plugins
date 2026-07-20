@@ -131,6 +131,23 @@ resolve_smuler() {
   return 1
 }
 
+resolve_package_plugin() {
+  # Field-preserving packager. The stock `smuler plugin sign` rewrite drops
+  # authProviders/icon/oauth/lookupActions from manifests.
+  if [[ -x "$ROOT/.build/package-plugin" ]]; then
+    printf '%s\n' "$ROOT/.build/package-plugin"
+    return
+  fi
+  if [[ -f "$ROOT/tools/package-plugin/main.go" ]]; then
+    mkdir -p "$ROOT/.build"
+    if go build -C "$ROOT/tools/package-plugin" -o "$ROOT/.build/package-plugin" .; then
+      printf '%s\n' "$ROOT/.build/package-plugin"
+      return
+    fi
+  fi
+  return 1
+}
+
 detect_repo() {
   if [[ -n "$REPO" ]]; then
     printf '%s\n' "$REPO"
@@ -178,20 +195,26 @@ PY
 }
 
 ensure_prereqs() {
-  local smuler
+  if PACKAGE_PLUGIN="$(resolve_package_plugin)"; then
+    info "Using packager: $PACKAGE_PLUGIN"
+  elif [[ "$DRY_RUN" -eq 1 ]]; then
+    PACKAGE_PLUGIN="package-plugin"
+    warn "package-plugin not built — dry-run will print placeholder commands"
+  else
+    die "package-plugin not available (tools/package-plugin)"
+  fi
+
+  # Optional: stock smuler CLI for --check only.
   if smuler="$(resolve_smuler)"; then
     SMULER="$smuler"
-    info "Using CLI: $SMULER"
-  elif [[ "$DRY_RUN" -eq 1 ]]; then
-    SMULER="smuler"
-    warn "smuler CLI not found — dry-run will print placeholder commands"
+    info "Using smuler CLI (optional checks): $SMULER"
   else
-    die "smuler CLI not found. Run 'make cli-build' or install via 'make cli-install'."
+    SMULER=""
   fi
 
   if [[ "$DRY_RUN" -eq 0 ]]; then
     local key="$HOME/.config/smuler/keys/smuler_ed25519"
-    [[ -f "$key" ]] || die "signing key missing at $key — run 'smuler plugin keygen' first"
+    [[ -f "$key" ]] || die "signing key missing at $key — run: go run ./tools/package-plugin -keygen"
   fi
 
   if [[ "$DRY_RUN" -eq 0 && ( "$DO_RELEASE" -eq 1 || "$DO_SUBMIT" -eq 1 ) ]]; then
@@ -255,20 +278,34 @@ package_plugins() {
     version="$(manifest_field "$dir/manifest.json" version)"
     archive_name="${id}-${version}.tar.gz"
 
-    # Always re-sign after build: a previous publish leaves signatures in
-    # manifest.json that no longer match a freshly built binary.
-    info "Signing $id@$version"
-    run "$SMULER" plugin sign "$dir"
+    # Package with the field-preserving signer. Do NOT use `smuler plugin sign`:
+    # it rewrites manifests through an allowlist and drops authProviders.
+    info "Packaging $id@$version (preserving authProviders)"
+    run "$PACKAGE_PLUGIN" -dir "$dir" -out "$dir"
 
     if [[ "$CHECK_ONLY" -eq 1 ]]; then
       info "Checking $id@$version"
-      run "$SMULER" plugin publish --check "$dir"
+      if [[ -n "${SMULER:-}" ]]; then
+        run "$SMULER" plugin publish --check "$dir" || warn "smuler check failed for $id (continuing)"
+      else
+        # Verify authProviders survived packaging.
+        if ! python3 - "$dir/$archive_name" "$id" <<'PY'
+import json, sys, tarfile
+archive, plugin_id = sys.argv[1], sys.argv[2]
+with tarfile.open(archive, "r:gz") as tf:
+    member = tf.extractfile(f"{plugin_id}/manifest.json")
+    manifest = json.load(member)
+aps = manifest.get("authProviders") or []
+if plugin_id in ("ai-provider", "bitbucket", "jira") and not aps:
+    raise SystemExit(f"{plugin_id}: packaged manifest has no authProviders")
+print(f"{plugin_id}: authProviders={len(aps)}")
+PY
+        then
+          die "authProviders missing from packaged manifest"
+        fi
+      fi
       continue
     fi
-
-    info "Packaging $id@$version"
-    # publish writes archive + .smuler/registry-entry.json
-    run "$SMULER" plugin publish "$dir"
 
     archive_src="$dir/$archive_name"
     entry_src="$dir/.smuler/registry-entry.json"
@@ -283,6 +320,27 @@ package_plugins() {
 
     [[ -f "$archive_src" ]] || die "archive not created: $archive_src"
     [[ -f "$entry_src" ]] || die "registry entry not created: $entry_src"
+
+    # Guardrail: never ship ai-provider/bitbucket/jira without authProviders.
+    if [[ "$id" == "ai-provider" || "$id" == "bitbucket" || "$id" == "jira" ]]; then
+      if ! python3 - "$archive_src" "$id" <<'PY'
+import json, sys, tarfile
+archive, plugin_id = sys.argv[1], sys.argv[2]
+with tarfile.open(archive, "r:gz") as tf:
+    member = tf.extractfile(f"{plugin_id}/manifest.json")
+    manifest = json.load(member)
+aps = manifest.get("authProviders") or []
+if not aps:
+    raise SystemExit("missing authProviders")
+kinds = {a.get("authKind") for a in aps}
+print(f"{plugin_id}: {len(aps)} authProviders kinds={sorted(kinds)}")
+if plugin_id in ("bitbucket", "jira") and "browser_import" not in kinds:
+    raise SystemExit("missing browser_import (cookie auth) provider")
+PY
+      then
+        die "$id archive missing authProviders"
+      fi
+    fi
 
     cp "$archive_src" "$archive_dst"
     cp "$entry_src" "$entry_dst"

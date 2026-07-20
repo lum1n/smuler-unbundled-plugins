@@ -481,7 +481,7 @@ func grokFetchBilling(ctx context.Context, authorizationHeader, cookieHeader str
 	req.Header.Set("Content-Type", "application/grpc-web+proto")
 	req.Header.Set("x-grpc-web", "1")
 	req.Header.Set("x-user-agent", "connect-es/2.1.1")
-	req.Header.Set("User-Agent", "smuler-ai-provider-plugin/0.1.0")
+	req.Header.Set("User-Agent", "smuler-ai-provider-plugin/0.1.1")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return grokBillingSnapshot{}, err
@@ -1164,7 +1164,7 @@ func devinFetch(ctx context.Context, path, token string) ([]byte, int, error) {
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", "smuler-ai-provider-plugin/0.1.0")
+	req.Header.Set("User-Agent", "smuler-ai-provider-plugin/0.1.1")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, 0, err

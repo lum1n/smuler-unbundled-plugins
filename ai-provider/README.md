@@ -15,8 +15,10 @@ Implementation notes:
 - Talks to each provider's API for live usage data
 - Requires host-level credential management (OAuth, API keys, browser sessions) except Gemini (CLI creds fallback) and Kiro (`kiro-cli`)
 
+Providers are declared in `manifest.json` under `authProviders` (OAuth, API key, browser session / cookie import, etc.) and appear in Settings. Connect a provider there to enable it.
+
 Current config keys:
-- `enabledProviders` - comma-separated list of provider IDs
+- `enabledProviders` - comma-separated list of provider IDs (managed by the host from Settings)
 - `warningThreshold` - percentage threshold for warning severity (default 75)
 - `criticalThreshold` - percentage threshold for critical severity (default 90)
 - `copilotAccountType` - account type for Copilot: `personal` (default) or `enterprise`
