@@ -1,0 +1,157 @@
+{
+  "id": "confluence",
+  "name": "Confluence",
+  "version": "0.1.0",
+  "description": "Recent documentation activity and search from Confluence Cloud or Server",
+  "icon": {
+    "type": "sfSymbol",
+    "value": "doc.text"
+  },
+  "executable": "bin/confluence-plugin",
+  "capabilities": [
+    "summary",
+    "items",
+    "actions",
+    "alerts"
+  ],
+  "domains": [
+    "docs"
+  ],
+  "authRequirements": [
+    "oauth",
+    "api_key",
+    "browser_import"
+  ],
+  "minimumHostVersion": "0.1.0",
+  "permissions": [
+    "network",
+    "background_refresh",
+    "notifications"
+  ],
+  "oauth": {
+    "authorizeURL": "https://auth.atlassian.com/authorize",
+    "tokenURL": "https://auth.atlassian.com/oauth/token",
+    "clientId": "smuler-confluence",
+    "scopes": [
+      "read:confluence-content.summary",
+      "read:confluence-space.summary",
+      "search:confluence",
+      "read:confluence-user",
+      "offline_access"
+    ]
+  },
+  "notificationEvents": [
+    {
+      "type": "page.created",
+      "title": "New page",
+      "description": "A new Confluence page or blog post appeared in your activity feed."
+    },
+    {
+      "type": "page.updated",
+      "title": "Page updated",
+      "description": "A tracked Confluence page was updated."
+    }
+  ],
+  "settings": [
+    {
+      "key": "confluence.domain",
+      "label": "Confluence domain",
+      "type": "string",
+      "default": "",
+      "placeholder": "https://your-domain.atlassian.net",
+      "help": "Your Confluence Cloud base URL (https://your-domain.atlassian.net) or Server/Data Center base URL."
+    },
+    {
+      "key": "confluence.space",
+      "label": "Space key",
+      "type": "string",
+      "default": "",
+      "placeholder": "ENG",
+      "help": "Optional space key to filter activity and default search."
+    },
+    {
+      "key": "confluence.maxItems",
+      "label": "Max items",
+      "type": "int",
+      "default": "10"
+    },
+    {
+      "key": "confluence.cql",
+      "label": "Custom CQL",
+      "type": "string",
+      "default": "",
+      "placeholder": "type = page AND label = handbook",
+      "help": "Optional CQL override for the activity feed. When set, space filter is ignored."
+    }
+  ],
+  "lookupActions": [
+    {
+      "kind": "pageId",
+      "actionId": "getPageDetails",
+      "payloadKey": "pageId",
+      "matchPattern": "\\b(?:pageId[=:]\\s*)?(\\d{5,})\\b",
+      "labelTemplate": "Fetch Confluence page {value}"
+    },
+    {
+      "kind": "confluenceUrl",
+      "actionId": "getPageByUrl",
+      "payloadKey": "url",
+      "matchPattern": "https?://[^\\s]+/(?:wiki/)?(?:spaces/[^/]+/pages/\\d+|pages/viewpage\\.action\\?pageId=\\d+)[^\\s]*",
+      "labelTemplate": "Fetch Confluence page"
+    },
+    {
+      "kind": "pageQuery",
+      "actionId": "searchDocs",
+      "payloadKey": "query",
+      "labelTemplate": "Search Confluence for \"{value}\""
+    }
+  ],
+  "authProviders": [
+    {
+      "id": "confluence-api",
+      "storageProviderId": "confluence",
+      "displayName": "API Token",
+      "authKind": "api_key",
+      "description": "Use an Atlassian account email and API token (Cloud) or username and personal access token (Server). Create a Cloud token at id.atlassian.com/manage-profile/security/api-tokens.",
+      "showEnableToggle": false,
+      "allowMultipleAccounts": false,
+      "apiKeyFormat": "username:password",
+      "usernamePlaceholder": "Email or username",
+      "passwordPlaceholder": "API token or PAT"
+    },
+    {
+      "id": "confluence-oauth",
+      "storageProviderId": "confluence",
+      "displayName": "OAuth",
+      "authKind": "oauth",
+      "description": "Sign in with Atlassian OAuth for Confluence Cloud. Grants read access to content, spaces, and search.",
+      "connectLabel": "Connect with Confluence",
+      "showEnableToggle": false,
+      "allowMultipleAccounts": false,
+      "oauth": {
+        "authorizeURL": "https://auth.atlassian.com/authorize",
+        "tokenURL": "https://auth.atlassian.com/oauth/token",
+        "clientId": "smuler-confluence",
+        "scopes": [
+          "read:confluence-content.summary",
+          "read:confluence-space.summary",
+          "search:confluence",
+          "read:confluence-user",
+          "offline_access"
+        ]
+      }
+    },
+    {
+      "id": "confluence-browser",
+      "storageProviderId": "confluence",
+      "displayName": "Cookie Auth",
+      "authKind": "browser_import",
+      "description": "Import a signed-in browser session cookie for your Confluence domain. Set the domain above first, then sign in and close the window.",
+      "deepLink": "https://id.atlassian.com/login",
+      "showEnableToggle": false,
+      "allowMultipleAccounts": false,
+      "fixedAccountId": "_browser",
+      "importURLFromSetting": "confluence.domain"
+    }
+  ]
+}
