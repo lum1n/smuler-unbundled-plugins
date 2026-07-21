@@ -1,7 +1,7 @@
 {
   "id": "agent-monitor",
   "name": "Agent Monitor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Monitors AI coding agents (Claude Code, Codex, OpenCode, Pi, Aider, Archer) from local process and session state, with native hook integration for tool-level status",
   "icon": {
     "type": "sfSymbol",
