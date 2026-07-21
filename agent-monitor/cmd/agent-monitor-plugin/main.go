@@ -59,6 +59,9 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 	if strings.HasPrefix(id, "dispatch_task-") {
 		pidStr := strings.TrimPrefix(id, "dispatch_task-")
 		task := params["task"]
+		if task == "" {
+			task = params["query"]
+		}
 		contextStr := params["context"]
 		return h.dispatchTask(pidStr, task, contextStr)
 	}
@@ -484,6 +487,26 @@ func (h *handler) GetStatus() sdk.Snapshot {
 		})
 	}
 
+	dispatchActions := make([]sdk.Action, 0, len(agents))
+	for _, a := range agents {
+		if a.PID <= 0 {
+			continue
+		}
+		switch a.State {
+		case "completed", "error":
+			continue
+		}
+		displayName := a.DisplayName
+		if displayName == "" {
+			displayName = strings.Title(a.AgentID)
+		}
+		pidStr := strconv.Itoa(a.PID)
+		dispatchActions = append(dispatchActions, sdk.Action{
+			ID:    "dispatch_task-" + pidStr,
+			Label: "Dispatch to " + displayName + " (pid " + pidStr + ")",
+		})
+	}
+
 	setup := h.setupItems(agents)
 	items = append(items, setup...)
 
@@ -532,7 +555,7 @@ func (h *handler) GetStatus() sdk.Snapshot {
 			IconHint: "cpu",
 		},
 		Items:        items,
-		Actions:      []sdk.Action{},
+		Actions:      dispatchActions,
 		Alerts:       alerts,
 		RefreshAfter: 5,
 		Health:       sdk.HealthOK,

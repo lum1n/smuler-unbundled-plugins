@@ -11,11 +11,15 @@
   "capabilities": [
     "summary",
     "items",
-    "alerts"
+    "alerts",
+    "actions"
   ],
   "domains": [
     "agent"
   ],
+  "composerTrigger": {
+    "character": "~"
+  },
   "authRequirements": [
     "none"
   ],
