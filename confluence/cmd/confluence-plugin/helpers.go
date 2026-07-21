@@ -123,7 +123,9 @@ func buildActivityCQL(space, custom string) string {
 func buildSearchCQL(query, space string) string {
 	query = strings.TrimSpace(query)
 	escaped := escapeCQLString(query)
-	cql := fmt.Sprintf(`type in (page,blogpost) AND (title ~ "%s" OR text ~ "%s")`, escaped, escaped)
+	// Prefer siteSearch (Confluence quick-find semantics) so companion/voice
+	// queries match pages outside the recent-activity snapshot.
+	cql := fmt.Sprintf(`type in (page,blogpost) AND (siteSearch ~ "%s" OR title ~ "%s" OR text ~ "%s")`, escaped, escaped, escaped)
 	if space = strings.TrimSpace(space); space != "" {
 		cql = fmt.Sprintf("space = %s AND %s", quoteCQLValue(space), cql)
 	}
@@ -257,6 +259,19 @@ func parseMaxItems(raw string, def int) int {
 		return 50
 	}
 	return n
+}
+
+func parseBool(raw string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return def
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 func absoluteWebURL(domain, webui string) string {

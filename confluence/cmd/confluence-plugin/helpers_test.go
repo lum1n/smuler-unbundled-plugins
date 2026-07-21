@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -59,8 +60,12 @@ func TestBuildActivityCQL(t *testing.T) {
 
 func TestBuildSearchCQL(t *testing.T) {
 	got := buildSearchCQL(`foo "bar"`, "ENG")
-	if !containsAll(got, `space = ENG`, `title ~ "foo \"bar\""`, `text ~ "foo \"bar\""`, "order by lastmodified desc") {
+	if !containsAll(got, `space = ENG`, `siteSearch ~ "foo \"bar\""`, `title ~ "foo \"bar\""`, `text ~ "foo \"bar\""`, "order by lastmodified desc") {
 		t.Errorf("search CQL unexpected: %q", got)
+	}
+	got = buildSearchCQL("onboarding", "")
+	if strings.Contains(got, "space =") {
+		t.Errorf("site-wide search should omit space: %q", got)
 	}
 }
 

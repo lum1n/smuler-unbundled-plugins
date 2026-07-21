@@ -226,3 +226,29 @@ func TestRPCResponseMarshaling(t *testing.T) {
 		t.Errorf("result.health: got %v", result["health"])
 	}
 }
+
+func TestParsePerformActionParams(t *testing.T) {
+	actionID, payload := parsePerformActionParams([]byte(`{
+		"actionId": "searchDocs",
+		"payload": {"query": "onboarding"}
+	}`))
+	if actionID != "searchDocs" || payload["query"] != "onboarding" {
+		t.Fatalf("string payload: action=%q payload=%v", actionID, payload)
+	}
+
+	actionID, payload = parsePerformActionParams([]byte(`{
+		"actionId": "searchDocs",
+		"payload": {"query": 42}
+	}`))
+	if actionID != "searchDocs" || payload["query"] != "42" {
+		t.Fatalf("numeric payload: action=%q payload=%v", actionID, payload)
+	}
+
+	actionID, payload = parsePerformActionParams([]byte(`{
+		"actionId": "searchDocs",
+		"query": "vacation policy"
+	}`))
+	if actionID != "searchDocs" || payload["query"] != "vacation policy" {
+		t.Fatalf("top-level query: action=%q payload=%v", actionID, payload)
+	}
+}

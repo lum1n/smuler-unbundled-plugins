@@ -18,8 +18,9 @@ import (
 
 const (
 	pluginID      = "confluence"
-	pluginVersion = "0.1.1"
+	pluginVersion = "0.1.2"
 	defaultMax    = 10
+	searchMax     = 25
 )
 
 type handler struct {
@@ -27,13 +28,14 @@ type handler struct {
 
 	mu sync.Mutex
 
-	domain   string
-	space    string
-	customCQL string
-	maxItems int
-	auth     confluenceAuth
-	cloudID  string
-	peerKeys map[string]struct{}
+	domain          string
+	space           string
+	customCQL       string
+	maxItems        int
+	searchSpaceOnly bool
+	auth            confluenceAuth
+	cloudID         string
+	peerKeys        map[string]struct{}
 
 	prevPages map[string]prevPageInfo
 	prevReady bool
@@ -67,6 +69,7 @@ func (h *handler) Initialize(params sdk.InitializeParams) string {
 	h.space = strings.TrimSpace(params.Config["space"])
 	h.customCQL = strings.TrimSpace(params.Config["cql"])
 	h.maxItems = parseMaxItems(params.Config["maxItems"], defaultMax)
+	h.searchSpaceOnly = parseBool(params.Config["searchSpaceOnly"], false)
 	h.auth = confluenceAuth{}
 	h.cloudID = ""
 
@@ -92,8 +95,8 @@ func (h *handler) Initialize(params sdk.InitializeParams) string {
 
 	h.peerKeys = collectPeerIssueKeys(toPeerLite(params.PeerSnapshots))
 
-	sdk.Log("initialize domain=%q space=%q max=%d auth=%q peers=%d",
-		h.domain, h.space, h.maxItems, h.auth.Kind, len(h.peerKeys))
+	sdk.Log("initialize domain=%q space=%q max=%d searchSpaceOnly=%t auth=%q peers=%d",
+		h.domain, h.space, h.maxItems, h.searchSpaceOnly, h.auth.Kind, len(h.peerKeys))
 
 	if h.domain == "" {
 		return sdk.HealthAuthReq
@@ -228,7 +231,10 @@ func (h *handler) GetStatus() sdk.Snapshot {
 			IconHint: "doc",
 		},
 		Items:        items,
-		Actions:      []sdk.Action{{ID: "refresh", Label: "Refresh"}},
+		Actions: []sdk.Action{
+			{ID: "searchDocs", Label: "Search Docs"},
+			{ID: "refresh", Label: "Refresh"},
+		},
 		Alerts:       []sdk.Alert{},
 		RefreshAfter: 120,
 		Health:       sdk.HealthOK,
@@ -298,14 +304,15 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 	defer cancel()
 
 	switch id {
-	case "searchDocs":
+	case "searchDocs", "search", "searchPages", "docsQuery":
 		query := firstNonEmpty(params, "query", "q", "text", "search", "value")
 		query = normalizeSearchQuery(query)
 		if query == "" {
 			return false, "missing query payload"
 		}
+		sdk.Log("searchDocs query=%q spaceOnly=%t space=%q", query, h.searchSpaceOnly, h.space)
 		return h.actionSearchDocs(ctx, query)
-	case "getPageDetails":
+	case "getPageDetails", "docsNumber":
 		pageID := firstNonEmpty(params, "pageId", "id", "query", "value")
 		pageID = strings.TrimSpace(pageID)
 		if pageID == "" {
@@ -318,7 +325,7 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 			pageID = m
 		}
 		return h.actionGetPageDetails(ctx, pageID)
-	case "getPageByUrl":
+	case "getPageByUrl", "docsUrl":
 		rawURL := firstNonEmpty(params, "url", "query", "value")
 		if rawURL == "" {
 			return false, "missing url payload"
@@ -338,9 +345,29 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 func (h *handler) Shutdown() {}
 
 func (h *handler) actionSearchDocs(ctx context.Context, query string) (bool, string) {
-	pages, err := h.searchContent(ctx, buildSearchCQL(query, h.space), h.maxItems)
+	// Companion search is site-wide by default so results are not limited to the
+	// activity-feed space / "current context". Opt into space scoping via setting.
+	space := ""
+	if h.searchSpaceOnly {
+		space = h.space
+	}
+	limit := searchMax
+	if h.maxItems > limit {
+		limit = h.maxItems
+	}
+
+	pages, err := h.searchContent(ctx, buildSearchCQL(query, space), limit)
 	if err != nil {
-		return false, err.Error()
+		// Fallback without siteSearch for Server/DC that may not support it.
+		fallback := fmt.Sprintf(`type in (page,blogpost) AND (title ~ "%s" OR text ~ "%s") order by lastmodified desc`, escapeCQLString(query), escapeCQLString(query))
+		if space != "" {
+			fallback = fmt.Sprintf("space = %s AND %s", quoteCQLValue(space), fallback)
+		}
+		sdk.Log("searchDocs primary failed (%v); trying fallback CQL", err)
+		pages, err = h.searchContent(ctx, fallback, limit)
+		if err != nil {
+			return false, err.Error()
+		}
 	}
 	if len(pages) == 0 {
 		return true, "No pages found."
@@ -349,6 +376,9 @@ func (h *handler) actionSearchDocs(ctx context.Context, query string) (bool, str
 	lines = append(lines, fmt.Sprintf("Found %d page(s):", len(pages)))
 	for _, p := range pages {
 		line := fmt.Sprintf("  - [%s] %s", p.SpaceKey, p.Title)
+		if p.Excerpt != "" {
+			line += " | " + truncate(p.Excerpt, 120)
+		}
 		if len(p.RelatedIssueKeys) > 0 {
 			line += " | issues: " + joinKeys(p.RelatedIssueKeys)
 		}
@@ -508,6 +538,8 @@ type contentResult struct {
 	Type    string `json:"type"`
 	Title   string `json:"title"`
 	Excerpt string `json:"excerpt"`
+	URL     string `json:"url"`
+	Content *contentResult `json:"content"` // nested in /search hits
 	Space   *struct {
 		Key  string `json:"key"`
 		Name string `json:"name"`
@@ -556,22 +588,68 @@ func (h *handler) searchContent(ctx context.Context, cql string, limit int) ([]c
 	q := url.Values{}
 	q.Set("cql", cql)
 	q.Set("limit", strconv.Itoa(limit))
-	q.Set("expand", "history.lastUpdated,space,version,metadata.labels")
-	apiURL := base + "/content/search?" + q.Encode()
 
-	body, err := h.doGET(ctx, apiURL)
+	// Prefer the site search endpoint (broader recall). Fall back to content/search.
+	searchURL := base + "/search?" + q.Encode() + "&expand=content.history.lastUpdated,content.space,content.version,content.metadata.labels"
+	body, err := h.doGET(ctx, searchURL)
+	if err == nil {
+		pages, parseErr := h.parseSearchBody(body)
+		if parseErr == nil && len(pages) > 0 {
+			return pages, nil
+		}
+		// Empty or unexpected shape — try content/search below.
+		if parseErr != nil {
+			sdk.Log("parse /search body: %v", parseErr)
+		}
+	} else {
+		sdk.Log("/search failed: %v", err)
+	}
+
+	q2 := url.Values{}
+	q2.Set("cql", cql)
+	q2.Set("limit", strconv.Itoa(limit))
+	q2.Set("expand", "history.lastUpdated,space,version,metadata.labels")
+	contentURL := base + "/content/search?" + q2.Encode()
+	body, err = h.doGET(ctx, contentURL)
 	if err != nil {
 		return nil, err
 	}
+	return h.parseSearchBody(body)
+}
+
+func (h *handler) parseSearchBody(body []byte) ([]confluencePage, error) {
 	var resp contentSearchResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("parse search response: %w", err)
 	}
 	pages := make([]confluencePage, 0, len(resp.Results))
 	for _, r := range resp.Results {
-		pages = append(pages, h.mapResult(r))
+		pages = append(pages, h.mapResult(flattenSearchHit(r)))
 	}
 	return pages, nil
+}
+
+func flattenSearchHit(r contentResult) contentResult {
+	if r.Content == nil {
+		return r
+	}
+	out := *r.Content
+	if out.Title == "" {
+		out.Title = r.Title
+	}
+	if r.Excerpt != "" {
+		out.Excerpt = r.Excerpt
+	}
+	if out.Links.WebUI == "" && r.URL != "" {
+		out.Links.WebUI = r.URL
+	}
+	if out.URL == "" && r.URL != "" {
+		out.URL = r.URL
+	}
+	if out.Space == nil && r.Space != nil {
+		out.Space = r.Space
+	}
+	return out
 }
 
 func (h *handler) fetchPage(ctx context.Context, pageID string) (confluencePage, error) {
@@ -639,7 +717,11 @@ func (h *handler) mapResult(r contentResult) confluencePage {
 	if p.Excerpt == "" {
 		p.Excerpt = truncate(strings.TrimSpace(bodyText), 200)
 	}
-	p.WebURL = absoluteWebURL(h.domain, r.Links.WebUI)
+	webui := r.Links.WebUI
+	if webui == "" {
+		webui = r.URL
+	}
+	p.WebURL = absoluteWebURL(h.domain, webui)
 	p.RelatedIssueKeys = extractIssueKeys(p.Title, p.Excerpt, bodyText, strings.Join(p.Labels, " "))
 	return p
 }

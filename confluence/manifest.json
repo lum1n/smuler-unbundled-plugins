@@ -1,8 +1,8 @@
 {
   "id": "confluence",
   "name": "Confluence",
-  "version": "0.1.1",
-  "description": "Recent documentation activity and search from Confluence Cloud or Server",
+  "version": "0.1.2",
+  "description": "Recent Confluence activity plus companion/voice search across all spaces for pages and docs",
   "icon": {
     "type": "sfSymbol",
     "value": "doc.text"
@@ -82,6 +82,13 @@
       "default": "",
       "placeholder": "type = page AND label = handbook",
       "help": "Optional CQL override for the activity feed. When set, space filter is ignored."
+    },
+    {
+      "key": "confluence.searchSpaceOnly",
+      "label": "Limit companion search to space",
+      "type": "bool",
+      "default": "false",
+      "help": "When false (default), companion/voice search queries the whole Confluence site — not only the activity space or recent items."
     }
   ],
   "lookupActions": [
@@ -101,6 +108,12 @@
     },
     {
       "kind": "docsQuery",
+      "actionId": "searchDocs",
+      "payloadKey": "query",
+      "labelTemplate": "Search Confluence for \"{value}\""
+    },
+    {
+      "kind": "docQuery",
       "actionId": "searchDocs",
       "payloadKey": "query",
       "labelTemplate": "Search Confluence for \"{value}\""
