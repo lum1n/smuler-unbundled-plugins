@@ -12,8 +12,10 @@ import (
 )
 
 var (
-	issueKeyPattern = regexp.MustCompile(`\b([A-Z][A-Z0-9_]+-\d+)\b`)
-	pageIDFromURL   = regexp.MustCompile(`(?:/pages/(\d+)|[?&]pageId=(\d+))`)
+	issueKeyPattern      = regexp.MustCompile(`\b([A-Z][A-Z0-9_]+-\d+)\b`)
+	pageIDFromURL        = regexp.MustCompile(`(?:/pages/(\d+)|[?&]pageId=(\d+))`)
+	digitsOnlyPageID     = regexp.MustCompile(`\d{5,}`)
+	voiceSearchPrefix    = regexp.MustCompile(`(?i)^\s*(?:(?:please\s+)?(?:search|find|look\s*up|show|get|open)\s+)?(?:(?:in\s+|on\s+|from\s+)?(?:confluence|docs?|documentation)\s+)?(?:(?:for|about|regarding)\s+)?(.+?)\s*$`)
 )
 
 type confluenceAuth struct {
@@ -274,4 +276,31 @@ func absoluteWebURL(domain, webui string) string {
 
 func joinKeys(keys []string) string {
 	return strings.Join(keys, ",")
+}
+
+func firstNonEmpty(params map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(params[k]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// normalizeSearchQuery strips common companion/voice prefixes so CQL search
+// uses the document topic rather than the whole utterance.
+func normalizeSearchQuery(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if m := voiceSearchPrefix.FindStringSubmatch(raw); len(m) == 2 {
+		trimmed := strings.TrimSpace(m[1])
+		// Avoid collapsing utterances that are only the product name.
+		lower := strings.ToLower(trimmed)
+		if trimmed != "" && lower != "confluence" && lower != "docs" && lower != "documentation" && lower != "doc" {
+			return trimmed
+		}
+	}
+	return raw
 }

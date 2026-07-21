@@ -160,6 +160,31 @@ func TestParseMaxItems(t *testing.T) {
 	}
 }
 
+func TestNormalizeSearchQuery(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"onboarding checklist", "onboarding checklist"},
+		{"search confluence for onboarding checklist", "onboarding checklist"},
+		{"find docs about SSO setup", "SSO setup"},
+		{"look up documentation for vacation policy", "vacation policy"},
+		{"confluence", "confluence"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := normalizeSearchQuery(tc.in); got != tc.want {
+			t.Errorf("normalizeSearchQuery(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestFirstNonEmpty(t *testing.T) {
+	got := firstNonEmpty(map[string]string{"q": "hello", "query": ""}, "query", "q", "text")
+	if got != "hello" {
+		t.Errorf("got %q", got)
+	}
+}
+
 func containsAll(s string, parts ...string) bool {
 	for _, p := range parts {
 		if !contains(s, p) {

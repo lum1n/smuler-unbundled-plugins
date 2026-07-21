@@ -1,7 +1,7 @@
 {
   "id": "confluence",
   "name": "Confluence",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Recent documentation activity and search from Confluence Cloud or Server",
   "icon": {
     "type": "sfSymbol",
@@ -86,21 +86,21 @@
   ],
   "lookupActions": [
     {
-      "kind": "pageId",
+      "kind": "docsNumber",
       "actionId": "getPageDetails",
       "payloadKey": "pageId",
-      "matchPattern": "\\b(?:pageId[=:]\\s*)?(\\d{5,})\\b",
+      "matchPattern": "\\b(?:(?:page|doc(?:ument)?|confluence)\\s*(?:id\\s*)?[=:]?\\s*)?(\\d{5,})\\b",
       "labelTemplate": "Fetch Confluence page {value}"
     },
     {
-      "kind": "confluenceUrl",
+      "kind": "docsUrl",
       "actionId": "getPageByUrl",
       "payloadKey": "url",
       "matchPattern": "https?://[^\\s]+/(?:wiki/)?(?:spaces/[^/]+/pages/\\d+|pages/viewpage\\.action\\?pageId=\\d+)[^\\s]*",
       "labelTemplate": "Fetch Confluence page"
     },
     {
-      "kind": "pageQuery",
+      "kind": "docsQuery",
       "actionId": "searchDocs",
       "payloadKey": "query",
       "labelTemplate": "Search Confluence for \"{value}\""

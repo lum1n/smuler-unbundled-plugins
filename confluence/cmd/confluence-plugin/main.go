@@ -18,7 +18,7 @@ import (
 
 const (
 	pluginID      = "confluence"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.1.1"
 	defaultMax    = 10
 )
 
@@ -299,19 +299,27 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 
 	switch id {
 	case "searchDocs":
-		query := strings.TrimSpace(params["query"])
+		query := firstNonEmpty(params, "query", "q", "text", "search", "value")
+		query = normalizeSearchQuery(query)
 		if query == "" {
 			return false, "missing query payload"
 		}
 		return h.actionSearchDocs(ctx, query)
 	case "getPageDetails":
-		pageID := strings.TrimSpace(params["pageId"])
+		pageID := firstNonEmpty(params, "pageId", "id", "query", "value")
+		pageID = strings.TrimSpace(pageID)
 		if pageID == "" {
 			return false, "missing pageId payload"
 		}
+		// Voice/companion may pass "page 123456" — keep digits when present.
+		if parsed := parsePageIDFromURL(pageID); parsed != "" {
+			pageID = parsed
+		} else if m := digitsOnlyPageID.FindString(pageID); m != "" {
+			pageID = m
+		}
 		return h.actionGetPageDetails(ctx, pageID)
 	case "getPageByUrl":
-		rawURL := strings.TrimSpace(params["url"])
+		rawURL := firstNonEmpty(params, "url", "query", "value")
 		if rawURL == "" {
 			return false, "missing url payload"
 		}
