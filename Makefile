@@ -3,7 +3,7 @@ SHELL := /bin/zsh
 
 # Bundled with the host app: git, vitals, ports, calendar (host-native), terminal-companion.
 # Everything else under plugins/ is registry/local-install (see plugins/<id>/Makefile).
-REGISTRY_PLUGINS := github linear jira bitbucket ai-provider agent-monitor ci-github-actions email jenkins teams cursor-cloud-agents
+REGISTRY_PLUGINS := github linear jira bitbucket confluence ai-provider agent-monitor ci-github-actions email jenkins teams cursor-cloud-agents
 
 .PHONY: help doctor test git-build plugin-check terminal-companion-build ports-build vitals-build plugins-build registry-plugins-build registry-plugins-install registry-plugins-publish host-build host-run host-icon host-version host-app host-clean mlx-metallib cli-build cli-install release release-check-signing release-zip release-notarize release-staple release-dmg release-verify release-setup-notary
 

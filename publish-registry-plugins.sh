@@ -26,6 +26,7 @@ DEFAULT_PLUGINS=(
   linear
   jira
   bitbucket
+  confluence
   ai-provider
   agent-monitor
   ci-github-actions
@@ -296,7 +297,7 @@ with tarfile.open(archive, "r:gz") as tf:
     member = tf.extractfile(f"{plugin_id}/manifest.json")
     manifest = json.load(member)
 aps = manifest.get("authProviders") or []
-if plugin_id in ("ai-provider", "bitbucket", "jira") and not aps:
+if plugin_id in ("ai-provider", "bitbucket", "jira", "confluence") and not aps:
     raise SystemExit(f"{plugin_id}: packaged manifest has no authProviders")
 print(f"{plugin_id}: authProviders={len(aps)}")
 PY
@@ -321,8 +322,8 @@ PY
     [[ -f "$archive_src" ]] || die "archive not created: $archive_src"
     [[ -f "$entry_src" ]] || die "registry entry not created: $entry_src"
 
-    # Guardrail: never ship ai-provider/bitbucket/jira without authProviders.
-    if [[ "$id" == "ai-provider" || "$id" == "bitbucket" || "$id" == "jira" ]]; then
+    # Guardrail: never ship ai-provider/bitbucket/jira/confluence without authProviders.
+    if [[ "$id" == "ai-provider" || "$id" == "bitbucket" || "$id" == "jira" || "$id" == "confluence" ]]; then
       if ! python3 - "$archive_src" "$id" <<'PY'
 import json, sys, tarfile
 archive, plugin_id = sys.argv[1], sys.argv[2]
@@ -334,7 +335,7 @@ if not aps:
     raise SystemExit("missing authProviders")
 kinds = {a.get("authKind") for a in aps}
 print(f"{plugin_id}: {len(aps)} authProviders kinds={sorted(kinds)}")
-if plugin_id in ("bitbucket", "jira") and "browser_import" not in kinds:
+if plugin_id in ("bitbucket", "jira", "confluence") and "browser_import" not in kinds:
     raise SystemExit("missing browser_import (cookie auth) provider")
 PY
       then

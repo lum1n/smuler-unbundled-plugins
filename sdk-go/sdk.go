@@ -176,17 +176,21 @@ func Run(pluginID, pluginVersion string, handler Handler) {
 			sendResult(req.ID, handler.GetStatus())
 
 		case "performAction":
-			var actionParams struct {
-				ActionID string            `json:"actionId"`
-				Payload  map[string]string `json:"payload"`
+			actionID, payload := parsePerformActionParams(req.Params)
+			if actionID == "" {
+				sendError(req.ID, -32602, "performAction missing actionId", false, "Retry the action.")
+				continue
 			}
-			if err := json.Unmarshal(req.Params, &actionParams); err == nil {
-				success, data := handler.PerformAction(actionParams.ActionID, actionParams.Payload)
-				sendResult(req.ID, struct {
-					Success bool   `json:"success"`
-					Data    string `json:"data,omitempty"`
-				}{success, data})
+			success, data := handler.PerformAction(actionID, payload)
+			result := struct {
+				Success bool   `json:"success"`
+				Data    string `json:"data,omitempty"`
+				Error   string `json:"error,omitempty"`
+			}{Success: success, Data: data}
+			if !success {
+				result.Error = data
 			}
+			sendResult(req.ID, result)
 		case "shutdown":
 			handler.Shutdown()
 			sendResult(req.ID, nil)
@@ -199,5 +203,99 @@ func Run(pluginID, pluginVersion string, handler Handler) {
 
 	if err := scanner.Err(); err != nil {
 		Log("stdin scanner error: %v", err)
+	}
+}
+
+// parsePerformActionParams accepts the host/companion payload shapes used in
+// the wild: payload map[string]string, payload map with non-string values,
+// and top-level query/value fields outside payload.
+func parsePerformActionParams(raw json.RawMessage) (string, map[string]string) {
+	payload := map[string]string{}
+	if len(raw) == 0 {
+		return "", payload
+	}
+
+	var loose struct {
+		ActionID string          `json:"actionId"`
+		Payload  json.RawMessage `json:"payload"`
+		Query    any             `json:"query"`
+		Value    any             `json:"value"`
+		PageID   any             `json:"pageId"`
+		URL      any             `json:"url"`
+		Q        any             `json:"q"`
+		Text     any             `json:"text"`
+		Search   any             `json:"search"`
+	}
+	if err := json.Unmarshal(raw, &loose); err != nil {
+		return "", payload
+	}
+
+	if len(loose.Payload) > 0 && string(loose.Payload) != "null" {
+		var asStrings map[string]string
+		if err := json.Unmarshal(loose.Payload, &asStrings); err == nil {
+			for k, v := range asStrings {
+				payload[k] = v
+			}
+		} else {
+			var asAny map[string]any
+			if err := json.Unmarshal(loose.Payload, &asAny); err == nil {
+				for k, v := range asAny {
+					if s := anyToString(v); s != "" {
+						payload[k] = s
+					}
+				}
+			}
+		}
+	}
+
+	// Promote top-level fields when payload omitted them.
+	setIfEmpty := func(key string, v any) {
+		if strings.TrimSpace(payload[key]) != "" {
+			return
+		}
+		if s := anyToString(v); s != "" {
+			payload[key] = s
+		}
+	}
+	setIfEmpty("query", loose.Query)
+	setIfEmpty("value", loose.Value)
+	setIfEmpty("pageId", loose.PageID)
+	setIfEmpty("url", loose.URL)
+	setIfEmpty("q", loose.Q)
+	setIfEmpty("text", loose.Text)
+	setIfEmpty("search", loose.Search)
+
+	return strings.TrimSpace(loose.ActionID), payload
+}
+
+func anyToString(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(t)
+	case float64:
+		// JSON numbers
+		if t == float64(int64(t)) {
+			return fmt.Sprintf("%d", int64(t))
+		}
+		return fmt.Sprintf("%v", t)
+	case bool:
+		return fmt.Sprintf("%t", t)
+	case []any:
+		parts := make([]string, 0, len(t))
+		for _, item := range t {
+			if s := anyToString(item); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return strings.TrimSpace(fmt.Sprintf("%v", t))
+		}
+		s := strings.TrimSpace(string(b))
+		return strings.Trim(s, `"`)
 	}
 }
