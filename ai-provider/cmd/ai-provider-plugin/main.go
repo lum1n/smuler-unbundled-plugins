@@ -781,10 +781,10 @@ func opencodeExtractInt(text string, pattern string) (int, bool) {
 	return 0, false
 }
 
+// opencodePercent clamps an already-percentage usage value to [0, 100].
+// OpenCode fields like usagePercent are on a 0–100 scale (e.g. 1 means 1%),
+// so values in (0, 1] must not be treated as fractions.
 func opencodePercent(raw float64) float64 {
-	if raw <= 1.0 && raw >= 0 {
-		raw *= 100
-	}
 	if raw < 0 {
 		return 0
 	}
@@ -981,7 +981,7 @@ func opencodeDeepSearch(data map[string]interface{}, kind string, depth int) (fl
 	return 0, 0
 }
 
-var opencodePercentKeys = []string{"usagePercent", "usedPercent", "percentUsed", "percent", "usage_percent", "used_percent", "utilization", "usage"}
+var opencodePercentKeys = []string{"usagePercent", "usedPercent", "percentUsed", "percent", "usage_percent", "used_percent", "utilization"}
 var opencodeResetKeys = []string{"resetInSec", "resetInSeconds", "resetSeconds", "reset_sec", "reset_in_sec", "resetsInSec", "resetIn"}
 
 func opencodeExtractPercent(window map[string]interface{}) float64 {

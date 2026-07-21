@@ -15,6 +15,56 @@ func TestOpencodeCookieHeaderKeepsSessionCookiesAndDropsAttributes(t *testing.T)
 	}
 }
 
+func TestOpencodePercentDoesNotScaleAlreadyPercentageValues(t *testing.T) {
+	tests := []struct {
+		raw  float64
+		want float64
+	}{
+		{0, 0},
+		{0.5, 0.5},
+		{1, 1},
+		{1.0, 1},
+		{19.5, 19.5},
+		{100, 100},
+		{-5, 0},
+		{150, 100},
+	}
+	for _, tc := range tests {
+		if got := opencodePercent(tc.raw); got != tc.want {
+			t.Fatalf("opencodePercent(%v) = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestOpencodeExtractPercentKeepsOnePercent(t *testing.T) {
+	window := map[string]interface{}{
+		"usagePercent": 1.0,
+		"resetInSec":   3600,
+	}
+	if got := opencodeExtractPercent(window); got != 1 {
+		t.Fatalf("opencodeExtractPercent() = %v, want 1", got)
+	}
+
+	data := map[string]interface{}{
+		"rollingUsage": map[string]interface{}{
+			"usagePercent": 1.0,
+			"resetInSec":   4907,
+		},
+		"weeklyUsage": map[string]interface{}{
+			"usagePercent": 1.0,
+			"resetInSec":   126983,
+		},
+	}
+	rollingPct, _ := opencodeExtractWindow(data, "rolling")
+	weeklyPct, _ := opencodeExtractWindow(data, "weekly")
+	// Fetch applies opencodePercent again after extract; ensure double clamp stays at 1%.
+	rollingPct = opencodePercent(rollingPct)
+	weeklyPct = opencodePercent(weeklyPct)
+	if rollingPct != 1 || weeklyPct != 1 {
+		t.Fatalf("rolling=%v weekly=%v, want 1 and 1", rollingPct, weeklyPct)
+	}
+}
+
 func TestCopilotAPIHost(t *testing.T) {
 	tests := []struct {
 		host string
