@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,18 +13,14 @@ import (
 	"time"
 
 	"github.com/lum1n/smuler/plugins/httphealth"
-	"github.com/lum1n/smuler/plugins/plugindebug"
+	sdk "github.com/lum1n/smuler/plugins/sdk-go"
 )
 
-func logDebug(format string, args ...interface{}) {
-	plugindebug.Log("[bitbucket-plugin]", format, args...)
-}
-
 const (
-	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.2"
-	cloudAPIBase    = "https://api.bitbucket.org/2.0"
-	cloudWebBase    = "https://bitbucket.org"
+	pluginID      = "bitbucket"
+	pluginVersion   = "0.1.3"
+	cloudAPIBase  = "https://api.bitbucket.org/2.0"
+	cloudWebBase  = "https://bitbucket.org"
 )
 
 type apiHTTPError struct {
@@ -37,151 +31,6 @@ type apiHTTPError struct {
 
 func (e *apiHTTPError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
-}
-
-// --- JSON-RPC types ---
-
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int              `json:"code"`
-	Message string           `json:"message"`
-	Data    *pluginErrorData `json:"data,omitempty"`
-}
-
-type pluginErrorData struct {
-	Retryable       bool   `json:"retryable"`
-	SuggestedAction string `json:"suggestedAction,omitempty"`
-}
-
-type initializeParams struct {
-	ProtocolVersion string                `json:"protocolVersion"`
-	PluginID        string                `json:"pluginId"`
-	Config          map[string]string     `json:"config"`
-	ProviderAuths   []providerAuthContext `json:"providerAuths"`
-}
-
-type providerAuthContext struct {
-	ProviderID   string `json:"providerId"`
-	Kind         string `json:"kind"`
-	AccountID    string `json:"accountId,omitempty"`
-	AccessToken  string `json:"accessToken,omitempty"`
-	APIKey       string `json:"apiKey,omitempty"`
-	CookieHeader string `json:"cookieHeader,omitempty"`
-}
-
-type initializedPayload struct {
-	Type            string `json:"type"`
-	ProtocolVersion string `json:"protocolVersion"`
-	PluginVersion   string `json:"pluginVersion"`
-	Health          string `json:"health"`
-}
-
-type pluginSnapshot struct {
-	PluginID     string         `json:"pluginId"`
-	State        string         `json:"state"`
-	Summary      pluginSummary  `json:"summary"`
-	Items        []pluginItem   `json:"items"`
-	Actions      []pluginAction `json:"actions"`
-	Alerts       []pluginAlert  `json:"alerts"`
-	RefreshAfter int            `json:"refreshAfter"`
-	Health       string         `json:"health"`
-}
-
-type pluginSummary struct {
-	Title    string `json:"title"`
-	Value    string `json:"value"`
-	Trend    string `json:"trend"`
-	Severity string `json:"severity"`
-	IconHint string `json:"iconHint"`
-}
-
-type pluginItem struct {
-	ID        string         `json:"id"`
-	Title     string         `json:"title"`
-	Subtitle  string         `json:"subtitle,omitempty"`
-	Detail    string         `json:"detail,omitempty"`
-	Severity  string         `json:"severity"`
-	Timestamp string         `json:"timestamp,omitempty"`
-	DeepLink  string         `json:"deepLink,omitempty"`
-	Actions   []pluginAction `json:"actions"`
-}
-
-type pluginAction struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-}
-
-type pluginAlert struct {
-	ID       string `json:"id"`
-	Severity string `json:"severity"`
-	Message  string `json:"message"`
-}
-
-type pluginEvent struct {
-	Type      string            `json:"type"`
-	PluginID  string            `json:"pluginId"`
-	Message   string            `json:"message"`
-	Severity  string            `json:"severity"`
-	Data      map[string]string `json:"data"`
-	Timestamp string            `json:"timestamp"`
-}
-
-type eventParams struct {
-	Event pluginEvent `json:"event"`
-}
-
-type performActionParams struct {
-	PluginID string            `json:"pluginId"`
-	ActionID string            `json:"actionId"`
-	Payload  map[string]string `json:"payload"`
-}
-
-type performActionResult struct {
-	Success bool            `json:"success"`
-	Data    string          `json:"data,omitempty"`
-	Error   string          `json:"error,omitempty"`
-	Window  *pluginWindow   `json:"window,omitempty"`
-	AI      *pluginAIAssist `json:"ai,omitempty"`
-}
-
-type pluginWindow struct {
-	ID       string                `json:"id"`
-	Title    string                `json:"title"`
-	Subtitle string                `json:"subtitle,omitempty"`
-	IconHint string                `json:"iconHint,omitempty"`
-	Sections []pluginWindowSection `json:"sections"`
-}
-
-type pluginWindowSection struct {
-	ID     string              `json:"id"`
-	Title  string              `json:"title,omitempty"`
-	Blocks []pluginWindowBlock `json:"blocks"`
-}
-
-type pluginWindowBlock struct {
-	ID    string `json:"id"`
-	Text  string `json:"text"`
-	Style string `json:"style,omitempty"`
-}
-
-type pluginAIAssist struct {
-	Task         string `json:"task"`
-	Input        string `json:"input"`
-	WindowID     string `json:"windowId"`
-	SectionTitle string `json:"sectionTitle,omitempty"`
 }
 
 // --- Common API types (normalized; both Cloud and Server map into these) ---
@@ -310,7 +159,7 @@ type cloudPaginatedDiffStats struct {
 }
 
 type serverPRActivity struct {
-	Action  string   `json:"action"`
+	Action  string     `json:"action"`
 	User    serverUser `json:"user"`
 	Comment struct {
 		Text string `json:"text"`
@@ -337,15 +186,15 @@ type serverUser struct {
 }
 
 type serverPaginatedResponse struct {
-	Values       []json.RawMessage `json:"values"`
-	Size         int               `json:"size"`
-	IsLastPage   bool              `json:"isLastPage"`
-	NextPageStart *int             `json:"nextPageStart"`
+	Values        []json.RawMessage `json:"values"`
+	Size          int               `json:"size"`
+	IsLastPage    bool              `json:"isLastPage"`
+	NextPageStart *int              `json:"nextPageStart"`
 }
 
 type serverRepo struct {
-	Slug string `json:"slug"`
-	Name string `json:"name"`
+	Slug  string `json:"slug"`
+	Name  string `json:"name"`
 	Links struct {
 		Clone []struct {
 			HREF string `json:"href"`
@@ -364,7 +213,7 @@ type serverPR struct {
 		User serverUser `json:"user"`
 	} `json:"author"`
 	FromRef struct {
-		DisplayID   string `json:"displayId"`
+		DisplayID    string `json:"displayId"`
 		LatestCommit string `json:"latestCommit"`
 	} `json:"fromRef"`
 	ToRef struct {
@@ -486,72 +335,7 @@ func (p *bitbucketPlugin) resolveBases() {
 	}
 }
 
-func main() {
-	logDebug("starting bitbucket plugin")
-
-	pl := &bitbucketPlugin{
-		client: &http.Client{Timeout: 25 * time.Second},
-		config: bitbucketConfig{
-			ShowMyPRs:         true,
-			ShowReviewRequests: true,
-			MaxPRs:            10,
-		},
-		prevPRStates: make(map[string]prStateInfo),
-		prCache:      make(map[int]bbPR),
-	}
-
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			logDebug("decode request failed: %v", err)
-			continue
-		}
-
-		switch req.Method {
-		case "initialize":
-			if err := pl.handleInitialize(req); err != nil {
-			logDebug("initialize failed: %v", err)
-				sendError(req.ID, -32000, err.Error(), false, "Check Bitbucket workspace and credentials.")
-			}
-		case "getStatus", "refresh":
-			snap, err := pl.buildSnapshot()
-			if err != nil {
-				logDebug("buildSnapshot failed: %v", err)
-				sendError(req.ID, -32000, err.Error(), true, "Bitbucket API may be unreachable.")
-				continue
-			}
-			sendResult(req.ID, snap)
-		case "performAction":
-			result, err := pl.handlePerformAction(req)
-			if err != nil {
-				logDebug("performAction failed: %v", err)
-				sendError(req.ID, -32000, err.Error(), false, "Action failed.")
-				continue
-			}
-			sendResult(req.ID, result)
-		case "shutdown":
-			logDebug("shutdown")
-			sendResult(req.ID, nil)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		logDebug("scanner error: %v", err)
-	}
-}
-
-func (p *bitbucketPlugin) handleInitialize(req rpcRequest) error {
-	var params initializeParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return fmt.Errorf("decode initialize: %w", err)
-	}
-
-	plugindebug.ConfigureFromInitializeConfig(params.Config)
+func (p *bitbucketPlugin) Initialize(params sdk.InitializeParams) string {
 	p.config = parseConfig(params.Config)
 	p.workspace = strings.TrimSpace(p.config.Workspace)
 	p.resolveBases()
@@ -583,88 +367,87 @@ func (p *bitbucketPlugin) handleInitialize(req rpcRequest) error {
 		}
 	}
 
-	logDebug("initialize workspace=%q authKind=%s serverMode=%t username=%q showMyPRs=%t showReviewRequests=%t showPipelines=%t max=%d",
+	sdk.Log("initialize workspace=%q authKind=%s serverMode=%t username=%q showMyPRs=%t showReviewRequests=%t showPipelines=%t max=%d",
 		p.workspace, p.auth.Kind, p.serverMode, p.config.Username, p.config.ShowMyPRs, p.config.ShowReviewRequests,
 		p.config.ShowPipelines, p.config.MaxPRs)
 
-	sendResult(req.ID, initializedPayload{
-		Type:            "initialized",
-		ProtocolVersion: protocolVersion,
-		PluginVersion:   pluginVersion,
-		Health:          "ok",
-	})
-	return nil
+	return sdk.HealthOK
 }
 
-func (p *bitbucketPlugin) handlePerformAction(req rpcRequest) (*performActionResult, error) {
+func (p *bitbucketPlugin) GetStatus() sdk.Snapshot {
+	return p.buildSnapshot()
+}
+
+func (p *bitbucketPlugin) PerformAction(id string, params map[string]string) (bool, string) {
+	return false, "use PerformActionResult"
+}
+
+func (p *bitbucketPlugin) PerformActionResult(id string, params map[string]string) sdk.ActionResult {
 	if p.workspace == "" {
-		return nil, fmt.Errorf("no Bitbucket workspace configured")
+		return sdk.ActionFail("no Bitbucket workspace configured")
 	}
 	if !p.auth.hasAuth() {
-		return nil, fmt.Errorf("no Bitbucket auth configured")
+		return sdk.ActionFail("no Bitbucket auth configured")
 	}
 
-	var params performActionParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return nil, fmt.Errorf("decode performAction params: %w", err)
-	}
-
-	switch params.ActionID {
+	switch id {
 	case "getPRDetails":
-		idStr := strings.TrimSpace(params.Payload["id"])
-		repoSlug := strings.TrimSpace(params.Payload["repoSlug"])
+		idStr := strings.TrimSpace(params["id"])
+		repoSlug := strings.TrimSpace(params["repoSlug"])
 		if idStr == "" || repoSlug == "" {
-			return nil, fmt.Errorf("missing id or repoSlug payload")
+			return sdk.ActionFail("missing id or repoSlug payload")
 		}
-		id, err := strconv.Atoi(idStr)
+		prID, err := strconv.Atoi(idStr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid id payload")
+			return sdk.ActionFail("invalid id payload")
 		}
-		return p.getPRDetails(id, repoSlug)
+		return p.getPRDetails(prID, repoSlug)
 	case "getMRDiff":
-		idStr := strings.TrimSpace(params.Payload["id"])
+		idStr := strings.TrimSpace(params["id"])
 		if idStr == "" {
-			return nil, fmt.Errorf("missing id payload")
+			return sdk.ActionFail("missing id payload")
 		}
-		id, err := strconv.Atoi(idStr)
+		prID, err := strconv.Atoi(idStr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid id payload")
+			return sdk.ActionFail("invalid id payload")
 		}
-		return p.getMRDiff(id)
+		return p.getMRDiff(prID)
 	case "summarize":
-		idStr := strings.TrimSpace(params.Payload["id"])
+		idStr := strings.TrimSpace(params["id"])
 		if idStr == "" {
-			return nil, fmt.Errorf("missing id payload")
+			return sdk.ActionFail("missing id payload")
 		}
-		id, err := strconv.Atoi(idStr)
+		prID, err := strconv.Atoi(idStr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid id payload")
+			return sdk.ActionFail("invalid id payload")
 		}
-		return p.summarizePR(id)
+		return p.summarizePR(prID)
 	case "searchPRs":
-		query := strings.TrimSpace(params.Payload["query"])
+		query := strings.TrimSpace(params["query"])
 		if query == "" {
-			return nil, fmt.Errorf("missing query payload")
+			return sdk.ActionFail("missing query payload")
 		}
 		return p.searchPRs(query)
 	default:
-		return nil, fmt.Errorf("unknown action %q", params.ActionID)
+		return sdk.ActionFail(fmt.Sprintf("unknown action: %s", id))
 	}
 }
 
-func (p *bitbucketPlugin) getPRDetails(id int, repoSlug string) (*performActionResult, error) {
+func (p *bitbucketPlugin) Shutdown() {}
+
+func (p *bitbucketPlugin) getPRDetails(id int, repoSlug string) sdk.ActionResult {
 	if p.serverMode {
 		return p.getPRDetailsServer(id, repoSlug)
 	}
 	return p.getPRDetailsCloud(id, repoSlug)
 }
 
-func (p *bitbucketPlugin) getPRDetailsCloud(id int, repoSlug string) (*performActionResult, error) {
+func (p *bitbucketPlugin) getPRDetailsCloud(id int, repoSlug string) sdk.ActionResult {
 	base := fmt.Sprintf("%s/repositories/%s/%s/pullrequests/%d", p.apiBase, p.workspace, repoSlug, id)
 
 	var pr cloudPR
 	if err := p.getJSON(base, &pr); err != nil {
-		return nil, err
+		return sdk.ActionFail(err.Error())
 	}
 	mapped := p.mapCloudPR(pr, repoSlug)
 
@@ -689,15 +472,15 @@ func (p *bitbucketPlugin) getPRDetailsCloud(id int, repoSlug string) (*performAc
 		diffStat = append(diffStat, fmt.Sprintf("%d files changed, +%d -%d", len(diffPage.Values), added, removed))
 	}
 
-	return p.formatPRDetails(mapped, comments, diffStat), nil
+	return p.formatPRDetails(mapped, comments, diffStat)
 }
 
-func (p *bitbucketPlugin) getPRDetailsServer(id int, repoSlug string) (*performActionResult, error) {
+func (p *bitbucketPlugin) getPRDetailsServer(id int, repoSlug string) sdk.ActionResult {
 	base := fmt.Sprintf("%s/projects/%s/repos/%s/pull-requests/%d", p.apiBase, p.workspace, repoSlug, id)
 
 	var sp serverPR
 	if err := p.getJSON(base, &sp); err != nil {
-		return nil, err
+		return sdk.ActionFail(err.Error())
 	}
 	repo := bbRepo{Slug: repoSlug, FullName: p.workspace + "/" + repoSlug}
 	mapped := p.mapServerPR(sp, repo)
@@ -718,10 +501,10 @@ func (p *bitbucketPlugin) getPRDetailsServer(id int, repoSlug string) (*performA
 
 	diffStat := []string{"(diff stats not available for server mode)"}
 
-	return p.formatPRDetails(mapped, comments, diffStat), nil
+	return p.formatPRDetails(mapped, comments, diffStat)
 }
 
-func (p *bitbucketPlugin) formatPRDetails(pr bbPR, comments, diffStat []string) *performActionResult {
+func (p *bitbucketPlugin) formatPRDetails(pr bbPR, comments, diffStat []string) sdk.ActionResult {
 	approvals := countApprovals(pr)
 	changesRequested := countChangesRequested(pr)
 
@@ -745,13 +528,13 @@ func (p *bitbucketPlugin) formatPRDetails(pr bbPR, comments, diffStat []string) 
 	}
 	lines = append(lines, fmt.Sprintf("Link: %s", pr.DeepLink))
 
-	return &performActionResult{Success: true, Data: strings.Join(lines, "\n")}
+	return sdk.ActionOK(strings.Join(lines, "\n"))
 }
 
-func (p *bitbucketPlugin) getMRDiff(id int) (*performActionResult, error) {
+func (p *bitbucketPlugin) getMRDiff(id int) sdk.ActionResult {
 	pr, ok := p.prCache[id]
 	if !ok {
-		return nil, fmt.Errorf("PR %d not found in cache", id)
+		return sdk.ActionFail(fmt.Sprintf("PR %d not found in cache", id))
 	}
 
 	var url string
@@ -763,23 +546,23 @@ func (p *bitbucketPlugin) getMRDiff(id int) (*performActionResult, error) {
 
 	diff, err := p.fetchRaw(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch diff: %w", err)
+		return sdk.ActionFail(fmt.Sprintf("failed to fetch diff: %v", err))
 	}
-	return &performActionResult{Success: true, Data: diff}, nil
+	return sdk.ActionOK(diff)
 }
 
-func (p *bitbucketPlugin) summarizePR(id int) (*performActionResult, error) {
+func (p *bitbucketPlugin) summarizePR(id int) sdk.ActionResult {
 	pr, ok := p.prCache[id]
 	if !ok {
-		return nil, fmt.Errorf("PR %d not found in cache", id)
+		return sdk.ActionFail(fmt.Sprintf("PR %d not found in cache", id))
 	}
 
-	diffResult, err := p.getMRDiff(id)
-	if err != nil {
-		return nil, err
+	diffResult := p.getMRDiff(id)
+	if !diffResult.Success {
+		return diffResult
 	}
-	if diffResult == nil || strings.TrimSpace(diffResult.Data) == "" {
-		return &performActionResult{Success: false, Error: "Empty diff"}, nil
+	if strings.TrimSpace(diffResult.Data) == "" {
+		return sdk.ActionFail("Empty diff")
 	}
 
 	title := pr.Title
@@ -789,31 +572,14 @@ func (p *bitbucketPlugin) summarizePR(id int) (*performActionResult, error) {
 	if title == "" {
 		title = fmt.Sprintf("PR #%d", id)
 	}
-	windowID := fmt.Sprintf("bitbucket.summarize.%d", id)
-	return &performActionResult{
-		Success: true,
-		Window: &pluginWindow{
-			ID:       windowID,
-			Title:    title,
-			Subtitle: "Bitbucket",
-			IconHint: "arrow.triangle.pull",
-			Sections: []pluginWindowSection{{
-				ID:    "loading",
-				Title: "Summary",
-				Blocks: []pluginWindowBlock{{
-					ID:    "generating",
-					Text:  "Generating summary...",
-					Style: "paragraph",
-				}},
-			}},
-		},
-		AI: &pluginAIAssist{
-			Task:         "summarize_bullets",
-			Input:        diffResult.Data,
-			WindowID:     windowID,
-			SectionTitle: "Summary",
-		},
-	}, nil
+	return sdk.ActionAITask(sdk.AIWindowOpts{
+		ID:       fmt.Sprintf("bitbucket.summarize.%d", id),
+		Title:    title,
+		Subtitle: "Bitbucket",
+		IconHint: "arrow.triangle.pull",
+		Task:     sdk.AITaskSummarizeBullets,
+		Input:    diffResult.Data,
+	})
 }
 
 func (p *bitbucketPlugin) fetchRaw(urlStr string) (string, error) {
@@ -832,10 +598,10 @@ func (p *bitbucketPlugin) fetchRaw(urlStr string) (string, error) {
 	return string(body), nil
 }
 
-func (p *bitbucketPlugin) searchPRs(query string) (*performActionResult, error) {
+func (p *bitbucketPlugin) searchPRs(query string) sdk.ActionResult {
 	repos, err := p.fetchRepos()
 	if err != nil {
-		return nil, err
+		return sdk.ActionFail(err.Error())
 	}
 
 	var all []bbPR
@@ -845,7 +611,7 @@ func (p *bitbucketPlugin) searchPRs(query string) (*performActionResult, error) 
 		all, err = p.fetchAllPRsCloud(repos)
 	}
 	if err != nil && !strings.HasPrefix(err.Error(), "partial:") {
-		return nil, err
+		return sdk.ActionFail(err.Error())
 	}
 
 	queryLower := strings.ToLower(query)
@@ -860,7 +626,7 @@ func (p *bitbucketPlugin) searchPRs(query string) (*performActionResult, error) 
 	}
 
 	if len(matches) == 0 {
-		return &performActionResult{Success: true, Data: "No matching pull requests found."}, nil
+		return sdk.ActionOK("No matching pull requests found.")
 	}
 
 	var lines []string
@@ -874,70 +640,70 @@ func (p *bitbucketPlugin) searchPRs(query string) (*performActionResult, error) 
 		lines = append(lines, "  - "+line)
 	}
 
-	return &performActionResult{Success: true, Data: strings.Join(lines, "\n")}, nil
+	return sdk.ActionOK(strings.Join(lines, "\n"))
 }
 
-func (p *bitbucketPlugin) buildSnapshot() (*pluginSnapshot, error) {
+func (p *bitbucketPlugin) buildSnapshot() sdk.Snapshot {
 	if p.workspace == "" {
-		return &pluginSnapshot{
-			PluginID:     "bitbucket",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "Bitbucket", Value: "No workspace", Trend: "steady", Severity: "info", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateDegraded,
+			Summary:      sdk.Summary{Title: "Bitbucket", Value: "No workspace", Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "pull-request"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{},
 			RefreshAfter: 120,
-			Health:       "degraded",
-		}, nil
+			Health:       sdk.HealthDegraded,
+		}
 	}
 
 	if !p.auth.hasAuth() {
-		return &pluginSnapshot{
-			PluginID:     "bitbucket",
-			State:        "error",
-			Summary:      pluginSummary{Title: "Bitbucket", Value: "No auth", Trend: "steady", Severity: "warning", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{{ID: "bitbucket-no-auth", Severity: "warning", Message: "Connect a Bitbucket account via Settings to see pull requests."}},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateError,
+			Summary:      sdk.Summary{Title: "Bitbucket", Value: "No auth", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "pull-request"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "bitbucket-no-auth", Severity: sdk.SeverityWarning, Message: "Connect a Bitbucket account via Settings to see pull requests."}},
 			RefreshAfter: 120,
-			Health:       "auth_required",
-		}, nil
+			Health:       sdk.HealthAuthReq,
+		}
 	}
 
 	user, err := p.fetchCurrentUser()
 	if err != nil {
-		logDebug("fetchCurrentUser error: %v", err)
-		return p.snapshotFromAPIError("Auth err", err), nil
+		sdk.Log("fetchCurrentUser error: %v", err)
+		return p.snapshotFromAPIError("Auth err", err)
 	}
 	p.currentUser = user
 
 	if user.Username == "" {
-		return &pluginSnapshot{
-			PluginID:     "bitbucket",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "Bitbucket", Value: "No username", Trend: "steady", Severity: "warning", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{{ID: "bitbucket-no-username", Severity: "warning", Message: "Set your Bitbucket username in plugin settings to filter pull requests."}},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateDegraded,
+			Summary:      sdk.Summary{Title: "Bitbucket", Value: "No username", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "pull-request"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "bitbucket-no-username", Severity: sdk.SeverityWarning, Message: "Set your Bitbucket username in plugin settings to filter pull requests."}},
 			RefreshAfter: 120,
-			Health:       "degraded",
-		}, nil
+			Health:       sdk.HealthDegraded,
+		}
 	}
 
 	repos, err := p.fetchRepos()
 	if err != nil {
-		logDebug("fetchRepos error: %v", err)
-		return p.snapshotFromAPIError("API err", err), nil
+		sdk.Log("fetchRepos error: %v", err)
+		return p.snapshotFromAPIError("API err", err)
 	}
 
 	allPRs, err := p.fetchAllPRs(repos)
 	var partialFetchErrors string
 	if err != nil {
-		logDebug("fetchAllPRs error: %v", err)
+		sdk.Log("fetchAllPRs error: %v", err)
 		if strings.HasPrefix(err.Error(), "partial:") {
 			partialFetchErrors = strings.TrimPrefix(err.Error(), "partial: ")
 		} else {
-			return p.snapshotFromAPIError("API err", err), nil
+			return p.snapshotFromAPIError("API err", err)
 		}
 	}
 
@@ -965,58 +731,58 @@ func (p *bitbucketPlugin) buildSnapshot() (*pluginSnapshot, error) {
 	}
 
 	if partialFetchErrors != "" {
-		alerts = append([]pluginAlert{{ID: "bitbucket-partial-fetch", Severity: "warning", Message: "Some repositories could not be fetched: " + partialFetchErrors}}, alerts...)
+		alerts = append([]sdk.Alert{{ID: "bitbucket-partial-fetch", Severity: sdk.SeverityWarning, Message: "Some repositories could not be fetched: " + partialFetchErrors}}, alerts...)
 	}
 
 	if items == nil {
-		items = []pluginItem{}
+		items = []sdk.Item{}
 	}
 	if alerts == nil {
-		alerts = []pluginAlert{}
+		alerts = []sdk.Alert{}
 	}
 
 	p.detectEvents(filtered, prStatuses)
 
-	return &pluginSnapshot{
-		PluginID:     "bitbucket",
-		State:        "ready",
+	return sdk.Snapshot{
+		PluginID:     pluginID,
+		State:        sdk.StateReady,
 		Summary:      summary,
 		Items:        items,
-		Actions:      []pluginAction{},
+		Actions:      []sdk.Action{},
 		Alerts:       alerts,
 		RefreshAfter: 120,
-		Health:       "ok",
-	}, nil
+		Health:       sdk.HealthOK,
+	}
 }
 
-func (p *bitbucketPlugin) degradedSnapshot(value, message, health string, retryAfter int) *pluginSnapshot {
+func (p *bitbucketPlugin) degradedSnapshot(value, message, health string, retryAfter int) sdk.Snapshot {
 	if health == "" {
-		health = httphealth.HealthDegraded
+		health = sdk.HealthDegraded
 	}
-	return &pluginSnapshot{
-		PluginID:     "bitbucket",
-		State:        "degraded",
-		Summary:      pluginSummary{Title: "Bitbucket", Value: value, Trend: "steady", Severity: "warning", IconHint: "pull-request"},
-		Items:        []pluginItem{},
-		Actions:      []pluginAction{},
-		Alerts:       []pluginAlert{{ID: "bitbucket-api-err", Severity: "warning", Message: message}},
+	return sdk.Snapshot{
+		PluginID:     pluginID,
+		State:        sdk.StateDegraded,
+		Summary:      sdk.Summary{Title: "Bitbucket", Value: value, Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "pull-request"},
+		Items:        []sdk.Item{},
+		Actions:      []sdk.Action{},
+		Alerts:       []sdk.Alert{{ID: "bitbucket-api-err", Severity: sdk.SeverityWarning, Message: message}},
 		RefreshAfter: httphealth.DefaultRefreshAfter(health, retryAfter),
 		Health:       health,
 	}
 }
 
-func (p *bitbucketPlugin) snapshotFromAPIError(value string, err error) *pluginSnapshot {
+func (p *bitbucketPlugin) snapshotFromAPIError(value string, err error) sdk.Snapshot {
 	if apiErr, ok := err.(*apiHTTPError); ok {
 		health := httphealth.ClassifyHTTPStatus(apiErr.StatusCode)
 		message := "Could not reach Bitbucket: " + apiErr.Error()
-		if health == httphealth.HealthAuthReq {
+		if health == sdk.HealthAuthReq {
 			message = "Bitbucket authentication failed — reconnect in Settings"
-		} else if health == httphealth.HealthRateLimited {
+		} else if health == sdk.HealthRateLimited {
 			message = "Bitbucket API rate limited"
 		}
 		return p.degradedSnapshot(value, message, health, apiErr.RetryAfter)
 	}
-	return p.degradedSnapshot(value, "Could not reach Bitbucket: "+err.Error(), httphealth.HealthDegraded, 0)
+	return p.degradedSnapshot(value, "Could not reach Bitbucket: "+err.Error(), sdk.HealthDegraded, 0)
 }
 
 // --- HTTP helpers ---
@@ -1027,7 +793,7 @@ func (p *bitbucketPlugin) doAPI(method, urlStr string) (*http.Response, error) {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "smuler-bitbucket-plugin/0.1.2")
+	req.Header.Set("User-Agent", "smuler-bitbucket-plugin/"+pluginVersion)
 	p.auth.apply(req)
 	return p.client.Do(req)
 }
@@ -1084,7 +850,7 @@ func (p *bitbucketPlugin) fetchCurrentUserCloud() (*bbUser, error) {
 	if err := p.getJSON(p.apiBase+"/user", &cu); err != nil {
 		return nil, err
 	}
-	logDebug("current user (cloud) uuid=%s username=%s", cu.UUID, cu.Username)
+	sdk.Log("current user (cloud) uuid=%s username=%s", cu.UUID, cu.Username)
 	return &bbUser{UUID: cu.UUID, Username: cu.Username, DisplayName: cu.DisplayName}, nil
 }
 
@@ -1096,9 +862,9 @@ func (p *bitbucketPlugin) fetchCurrentUserServer() (*bbUser, error) {
 		url := fmt.Sprintf("%s/users/%s", p.apiBase, username)
 		var su serverUser
 		if err := p.getJSON(url, &su); err != nil {
-			logDebug("server user lookup failed for %q: %v", username, err)
+			sdk.Log("server user lookup failed for %q: %v", username, err)
 		} else {
-			logDebug("current user (server) name=%s displayName=%s", su.Name, su.DisplayName)
+			sdk.Log("current user (server) name=%s displayName=%s", su.Name, su.DisplayName)
 			return &bbUser{UUID: su.Name, Username: su.Name, DisplayName: su.DisplayName}, nil
 		}
 	}
@@ -1108,7 +874,7 @@ func (p *bitbucketPlugin) fetchCurrentUserServer() (*bbUser, error) {
 	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		resp.Body.Close()
 		if h := headers.Get("X-Ausername"); h != "" {
-			logDebug("current user (server, from header) username=%s", h)
+			sdk.Log("current user (server, from header) username=%s", h)
 			return &bbUser{UUID: h, Username: h, DisplayName: h}, nil
 		}
 	}
@@ -1143,7 +909,7 @@ func (p *bitbucketPlugin) fetchReposCloud() ([]bbRepo, error) {
 		nextURL = page.Next
 	}
 
-	logDebug("fetched repos count=%d (cloud)", len(all))
+	sdk.Log("fetched repos count=%d (cloud)", len(all))
 	return all, nil
 }
 
@@ -1175,7 +941,7 @@ func (p *bitbucketPlugin) fetchReposServer() ([]bbRepo, error) {
 		}
 	}
 
-	logDebug("fetched repos count=%d (server)", len(all))
+	sdk.Log("fetched repos count=%d (server)", len(all))
 	return all, nil
 }
 
@@ -1212,11 +978,11 @@ func (p *bitbucketPlugin) fetchAllPRsCloud(repos []bbRepo) ([]bbPR, error) {
 					errCh <- fmt.Errorf("%s: %w", r.FullName, err)
 					return
 				}
-			mu.Lock()
-			for _, pr := range page.Values {
-				all = append(all, p.mapCloudPR(pr, r.Slug))
-			}
-			mu.Unlock()
+				mu.Lock()
+				for _, pr := range page.Values {
+					all = append(all, p.mapCloudPR(pr, r.Slug))
+				}
+				mu.Unlock()
 				nextURL = page.Next
 			}
 		}(repo)
@@ -1229,11 +995,11 @@ func (p *bitbucketPlugin) fetchAllPRsCloud(repos []bbRepo) ([]bbPR, error) {
 		errs = append(errs, e.Error())
 	}
 	if len(errs) > 0 {
-		logDebug("some repo fetches failed: %s", strings.Join(errs, "; "))
+		sdk.Log("some repo fetches failed: %s", strings.Join(errs, "; "))
 		return all, fmt.Errorf("partial: %s", strings.Join(errs, "; "))
 	}
 
-	logDebug("fetched prs count=%d (cloud)", len(all))
+	sdk.Log("fetched prs count=%d (cloud)", len(all))
 	return all, nil
 }
 
@@ -1258,11 +1024,11 @@ func (p *bitbucketPlugin) mapCloudPR(pr cloudPR, repoSlug string) bbPR {
 	for _, r := range pr.Reviewers {
 		mapped.Reviewers = append(mapped.Reviewers, bbUser{UUID: r.UUID, Username: r.Username, DisplayName: r.DisplayName})
 	}
-	for _, p := range pr.Participants {
+	for _, pt := range pr.Participants {
 		mapped.Participants = append(mapped.Participants, bbParticipant{
-			User:     bbUser{UUID: p.User.UUID, Username: p.User.Username, DisplayName: p.User.DisplayName},
-			Approved: p.Approved,
-			State:    p.State,
+			User:     bbUser{UUID: pt.User.UUID, Username: pt.User.Username, DisplayName: pt.User.DisplayName},
+			Approved: pt.Approved,
+			State:    pt.State,
 		})
 	}
 	return mapped
@@ -1293,7 +1059,7 @@ func (p *bitbucketPlugin) fetchAllPRsServer(repos []bbRepo) ([]bbPR, error) {
 				for _, raw := range page.Values {
 					var sp serverPR
 					if err := json.Unmarshal(raw, &sp); err != nil {
-						logDebug("unmarshal server pr: %v", err)
+						sdk.Log("unmarshal server pr: %v", err)
 						continue
 					}
 					all = append(all, p.mapServerPR(sp, r))
@@ -1319,11 +1085,11 @@ func (p *bitbucketPlugin) fetchAllPRsServer(repos []bbRepo) ([]bbPR, error) {
 		errs = append(errs, e.Error())
 	}
 	if len(errs) > 0 {
-		logDebug("some repo fetches failed: %s", strings.Join(errs, "; "))
+		sdk.Log("some repo fetches failed: %s", strings.Join(errs, "; "))
 		return all, fmt.Errorf("partial: %s", strings.Join(errs, "; "))
 	}
 
-	logDebug("fetched prs count=%d (server)", len(all))
+	sdk.Log("fetched prs count=%d (server)", len(all))
 	return all, nil
 }
 
@@ -1436,8 +1202,8 @@ func (p *bitbucketPlugin) filterPRs(all []bbPR) []bbPR {
 
 // --- Snapshot builders ---
 
-func (p *bitbucketPlugin) buildItems(prs []bbPR, statuses map[int][]bbCommitStatus) []pluginItem {
-	items := make([]pluginItem, 0, len(prs))
+func (p *bitbucketPlugin) buildItems(prs []bbPR, statuses map[int][]bbCommitStatus) []sdk.Item {
+	items := make([]sdk.Item, 0, len(prs))
 	for _, pr := range prs {
 		repoName := pr.DestBranch
 		if repoName == "" {
@@ -1463,7 +1229,7 @@ func (p *bitbucketPlugin) buildItems(prs []bbPR, statuses map[int][]bbCommitStat
 
 		subtitle := fmt.Sprintf("%s · %s", repoName, pr.Author.DisplayName)
 
-		items = append(items, pluginItem{
+		items = append(items, sdk.Item{
 			ID:        fmt.Sprintf("%d", pr.ID),
 			Title:     title,
 			Subtitle:  subtitle,
@@ -1471,7 +1237,7 @@ func (p *bitbucketPlugin) buildItems(prs []bbPR, statuses map[int][]bbCommitStat
 			Severity:  severity,
 			Timestamp: pr.UpdatedOn,
 			DeepLink:  deepLink,
-			Actions:   []pluginAction{{ID: "summarize", Label: "Summarize"}},
+			Actions:   []sdk.Action{{ID: "summarize", Label: "Summarize"}},
 		})
 	}
 	return items
@@ -1487,8 +1253,8 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-func (p *bitbucketPlugin) buildAlerts(prs []bbPR, statuses map[int][]bbCommitStatus) []pluginAlert {
-	var alerts []pluginAlert
+func (p *bitbucketPlugin) buildAlerts(prs []bbPR, statuses map[int][]bbCommitStatus) []sdk.Alert {
+	var alerts []sdk.Alert
 
 	failCount := 0
 	for _, pr := range prs {
@@ -1497,9 +1263,9 @@ func (p *bitbucketPlugin) buildAlerts(prs []bbPR, statuses map[int][]bbCommitSta
 		}
 	}
 	if failCount > 0 {
-		alerts = append(alerts, pluginAlert{
+		alerts = append(alerts, sdk.Alert{
 			ID:       "bitbucket-build-fail",
-			Severity: "critical",
+			Severity: sdk.SeverityCritical,
 			Message:  fmt.Sprintf("%d PR(s) with failing builds", failCount),
 		})
 	}
@@ -1511,9 +1277,9 @@ func (p *bitbucketPlugin) buildAlerts(prs []bbPR, statuses map[int][]bbCommitSta
 		}
 	}
 	if changesRequested > 0 {
-		alerts = append(alerts, pluginAlert{
+		alerts = append(alerts, sdk.Alert{
 			ID:       "bitbucket-changes-requested",
-			Severity: "warning",
+			Severity: sdk.SeverityWarning,
 			Message:  fmt.Sprintf("%d PR(s) with changes requested", changesRequested),
 		})
 	}
@@ -1521,25 +1287,25 @@ func (p *bitbucketPlugin) buildAlerts(prs []bbPR, statuses map[int][]bbCommitSta
 	return alerts
 }
 
-func (p *bitbucketPlugin) buildSummary(items []pluginItem, total int) pluginSummary {
+func (p *bitbucketPlugin) buildSummary(items []sdk.Item, total int) sdk.Summary {
 	if len(items) == 0 {
-		return pluginSummary{
+		return sdk.Summary{
 			Title:    "Bitbucket",
 			Value:    "0 PRs",
-			Trend:    "steady",
-			Severity: "info",
+			Trend:    sdk.TrendSteady,
+			Severity: sdk.SeverityInfo,
 			IconHint: "pull-request",
 		}
 	}
 
-	severity := "info"
+	severity := sdk.SeverityInfo
 	for _, item := range items {
-		if item.Severity == "critical" {
-			severity = "critical"
+		if item.Severity == sdk.SeverityCritical {
+			severity = sdk.SeverityCritical
 			break
 		}
-		if item.Severity == "warning" && severity != "critical" {
-			severity = "warning"
+		if item.Severity == sdk.SeverityWarning && severity != sdk.SeverityCritical {
+			severity = sdk.SeverityWarning
 		}
 	}
 
@@ -1548,10 +1314,10 @@ func (p *bitbucketPlugin) buildSummary(items []pluginItem, total int) pluginSumm
 		value = fmt.Sprintf("%d+", p.config.MaxPRs)
 	}
 
-	return pluginSummary{
+	return sdk.Summary{
 		Title:    "Bitbucket",
 		Value:    fmt.Sprintf("%s PRs", value),
-		Trend:    "steady",
+		Trend:    sdk.TrendSteady,
 		Severity: severity,
 		IconHint: "pull-request",
 	}
@@ -1571,14 +1337,12 @@ func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitSt
 	for key, oldState := range prevKeys {
 		newState, ok := currentStates[key]
 		if !ok {
-			logDebug("pr removed id=%s", key)
-			emitEvent(pluginEvent{
-				Type:      "pr.merged",
-				PluginID:  "bitbucket",
-				Message:   fmt.Sprintf("PR #%s was merged or closed", key),
-				Severity:  "info",
-				Data:      map[string]string{"prId": key, "url": oldState.deepLink},
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			sdk.Log("pr removed id=%s", key)
+			sdk.Emit(sdk.Event{
+				Type:     "pr.merged",
+				Message:  fmt.Sprintf("PR #%s was merged or closed", key),
+				Severity: sdk.SeverityInfo,
+				Data:     map[string]string{"prId": key, "url": oldState.deepLink},
 			})
 			continue
 		}
@@ -1586,13 +1350,11 @@ func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitSt
 			oldFailed := strings.Contains(oldState.hash, "build:failed")
 			newFailed := strings.Contains(newState.hash, "build:failed")
 			if !oldFailed && newFailed {
-				emitEvent(pluginEvent{
-					Type:      "pr.status_failed",
-					PluginID:  "bitbucket",
-					Message:   fmt.Sprintf("Build failed on PR #%s", key),
-					Severity:  "critical",
-					Data:      map[string]string{"prId": key, "url": newState.deepLink},
-					Timestamp: time.Now().UTC().Format(time.RFC3339),
+				sdk.Emit(sdk.Event{
+					Type:     "pr.status_failed",
+					Message:  fmt.Sprintf("Build failed on PR #%s", key),
+					Severity: sdk.SeverityCritical,
+					Data:     map[string]string{"prId": key, "url": newState.deepLink},
 				})
 			}
 		}
@@ -1600,14 +1362,12 @@ func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitSt
 
 	for key, info := range currentStates {
 		if _, ok := prevKeys[key]; !ok && len(prevKeys) > 0 {
-			logDebug("new pr id=%s", key)
-			emitEvent(pluginEvent{
-				Type:      "pr.created",
-				PluginID:  "bitbucket",
-				Message:   fmt.Sprintf("New pull request #%s", key),
-				Severity:  "info",
-				Data:      map[string]string{"prId": key, "url": info.deepLink},
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			sdk.Log("new pr id=%s", key)
+			sdk.Emit(sdk.Event{
+				Type:     "pr.created",
+				Message:  fmt.Sprintf("New pull request #%s", key),
+				Severity: sdk.SeverityInfo,
+				Data:     map[string]string{"prId": key, "url": info.deepLink},
 			})
 		}
 	}
@@ -1619,12 +1379,12 @@ func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitSt
 
 func prSeverity(pr bbPR, currentUser *bbUser, statuses map[int][]bbCommitStatus) string {
 	if buildFailed(statuses[pr.ID]) {
-		return "critical"
+		return sdk.SeverityCritical
 	}
 	if hasChangesRequested(pr, currentUser) {
-		return "warning"
+		return sdk.SeverityWarning
 	}
-	return "info"
+	return sdk.SeverityInfo
 }
 
 func prDetail(pr bbPR, currentUser *bbUser, statuses map[int][]bbCommitStatus) string {
@@ -1767,9 +1527,9 @@ func millisToISO(ms int64) string {
 
 func parseConfig(cfg map[string]string) bitbucketConfig {
 	config := bitbucketConfig{
-		ShowMyPRs:         true,
+		ShowMyPRs:          true,
 		ShowReviewRequests: true,
-		MaxPRs:            10,
+		MaxPRs:             10,
 	}
 	if v, ok := cfg["serverUrl"]; ok {
 		config.ServerURL = normalizeServerURL(v)
@@ -1828,42 +1588,15 @@ func parseBool(raw string, defaultValue bool) bool {
 	}
 }
 
-func sendResult(id int, result interface{}) {
-	resp := rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
-}
-
-func sendError(id int, code int, message string, retryable bool, suggestedAction string) {
-	resp := rpcResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &rpcError{
-			Code:    code,
-			Message: message,
-			Data:    &pluginErrorData{Retryable: retryable, SuggestedAction: suggestedAction},
+func main() {
+	sdk.Run(pluginID, pluginVersion, &bitbucketPlugin{
+		client: &http.Client{Timeout: 25 * time.Second},
+		config: bitbucketConfig{
+			ShowMyPRs:          true,
+			ShowReviewRequests: true,
+			MaxPRs:             10,
 		},
-	}
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
-}
-
-func emitEvent(event pluginEvent) {
-	event.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	params := eventParams{Event: event}
-	payload, err := json.Marshal(params)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	out := fmt.Sprintf(`{"jsonrpc":"2.0","method":"event","params":%s}`, string(payload))
-	fmt.Fprintf(os.Stdout, "%s\n", out)
+		prevPRStates: make(map[string]prStateInfo),
+		prCache:      make(map[int]bbPR),
+	})
 }

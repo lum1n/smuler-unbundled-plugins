@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lum1n/smuler/plugins/plugindebug"
+	sdk "github.com/lum1n/smuler/plugins/sdk-go"
 )
 
 var httpClient = &http.Client{
@@ -36,131 +35,10 @@ var httpClient = &http.Client{
 	Timeout: 20 * time.Second,
 }
 
-func logDebug(format string, args ...interface{}) {
-	plugindebug.Log("[ai-provider-plugin]", format, args...)
-}
-
 const (
-	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.1"
-	pluginID        = "ai-provider"
+	pluginVersion   = "0.1.2"
+	pluginID      = "ai-provider"
 )
-
-// --- JSON-RPC types ---
-
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int              `json:"code"`
-	Message string           `json:"message"`
-	Data    *pluginErrorData `json:"data,omitempty"`
-}
-
-type pluginErrorData struct {
-	Retryable       bool   `json:"retryable"`
-	SuggestedAction string `json:"suggestedAction,omitempty"`
-}
-
-// --- Initialize / Auth types ---
-
-type initializeParams struct {
-	ProtocolVersion string                `json:"protocolVersion"`
-	PluginID        string                `json:"pluginId"`
-	Config          map[string]string     `json:"config"`
-	Auth            *authContext          `json:"auth"`          // backward compat
-	ProviderAuths   []providerAuthContext `json:"providerAuths"` // new multi-provider
-}
-
-type authContext struct {
-	AccountID string `json:"accountId"`
-}
-
-type providerAuthContext struct {
-	ProviderID   string `json:"providerId"`
-	Kind         string `json:"kind"`
-	AccountID    string `json:"accountId,omitempty"`
-	AccessToken  string `json:"accessToken,omitempty"`
-	APIKey       string `json:"apiKey,omitempty"`
-	CookieHeader string `json:"cookieHeader,omitempty"`
-	ExpiresAt    string `json:"expiresAt,omitempty"`
-	DisplayName  string `json:"displayName,omitempty"`
-}
-
-type initializedPayload struct {
-	Type            string `json:"type"`
-	ProtocolVersion string `json:"protocolVersion"`
-	PluginVersion   string `json:"pluginVersion"`
-	Health          string `json:"health"`
-}
-
-// --- Snapshot types ---
-
-type pluginSnapshot struct {
-	PluginID     string         `json:"pluginId"`
-	State        string         `json:"state"`
-	Summary      pluginSummary  `json:"summary"`
-	Items        []pluginItem   `json:"items"`
-	Actions      []pluginAction `json:"actions"`
-	Alerts       []pluginAlert  `json:"alerts"`
-	RefreshAfter int            `json:"refreshAfter"`
-	Health       string         `json:"health"`
-}
-
-type pluginSummary struct {
-	Title    string `json:"title"`
-	Value    string `json:"value"`
-	Trend    string `json:"trend"`
-	Severity string `json:"severity"`
-	IconHint string `json:"iconHint"`
-}
-
-type pluginItem struct {
-	ID        string            `json:"id"`
-	Title     string            `json:"title"`
-	Subtitle  string            `json:"subtitle,omitempty"`
-	Detail    string            `json:"detail,omitempty"`
-	Severity  string            `json:"severity"`
-	Timestamp string            `json:"timestamp,omitempty"`
-	DeepLink  string            `json:"deepLink,omitempty"`
-	Actions   []pluginAction    `json:"actions"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-}
-
-type pluginAction struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-}
-
-type pluginAlert struct {
-	ID       string `json:"id"`
-	Severity string `json:"severity"`
-	Message  string `json:"message"`
-}
-
-type pluginEvent struct {
-	Type      string            `json:"type"`
-	PluginID  string            `json:"pluginId"`
-	Message   string            `json:"message"`
-	Severity  string            `json:"severity"`
-	Data      map[string]string `json:"data"`
-	Timestamp string            `json:"timestamp"`
-}
-
-type eventParams struct {
-	Event pluginEvent `json:"event"`
-}
 
 // --- Provider interface ---
 
@@ -272,7 +150,7 @@ type aiProviderPlugin struct {
 	client       *http.Client
 	config       aiProviderConfig
 	providerAuth map[string][]AuthContext
-	lastSnapshot *pluginSnapshot
+	lastSnapshot *sdk.Snapshot
 	prevUsage    map[string]float64 // providerID -> previous usage percent
 }
 
@@ -2286,7 +2164,6 @@ type fetchResult struct {
 }
 
 func (p *aiProviderPlugin) emitProviderEvents(results map[string]fetchResult) {
-	now := time.Now().UTC().Format(time.RFC3339)
 	warnThreshold := p.config.WarningThreshold
 	critThreshold := p.config.CriticalThreshold
 
@@ -2301,52 +2178,36 @@ func (p *aiProviderPlugin) emitProviderEvents(results map[string]fetchResult) {
 
 		if hadPrev {
 			if prevPct < critThreshold && currentPct >= critThreshold {
-				sendNotification("event", eventParams{
-					Event: pluginEvent{
-						Type:      "usage.threshold_crossed",
-						PluginID:  pluginID,
-						Message:   fmt.Sprintf("%s usage crossed critical threshold (%.0f%%)", displayName, currentPct),
-						Severity:  "critical",
-						Data:      map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "usagePercent": fmt.Sprintf("%.0f", currentPct), "threshold": "critical"},
-						Timestamp: now,
-					},
+				sdk.Emit(sdk.Event{
+					Type:     "usage.threshold_crossed",
+					Message:  fmt.Sprintf("%s usage crossed critical threshold (%.0f%%)", displayName, currentPct),
+					Severity: sdk.SeverityCritical,
+					Data:     map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "usagePercent": fmt.Sprintf("%.0f", currentPct), "threshold": "critical"},
 				})
 			} else if prevPct < warnThreshold && currentPct >= warnThreshold && currentPct < critThreshold {
-				sendNotification("event", eventParams{
-					Event: pluginEvent{
-						Type:      "usage.threshold_crossed",
-						PluginID:  pluginID,
-						Message:   fmt.Sprintf("%s usage crossed warning threshold (%.0f%%)", displayName, currentPct),
-						Severity:  "warning",
-						Data:      map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "usagePercent": fmt.Sprintf("%.0f", currentPct), "threshold": "warning"},
-						Timestamp: now,
-					},
+				sdk.Emit(sdk.Event{
+					Type:     "usage.threshold_crossed",
+					Message:  fmt.Sprintf("%s usage crossed warning threshold (%.0f%%)", displayName, currentPct),
+					Severity: sdk.SeverityWarning,
+					Data:     map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "usagePercent": fmt.Sprintf("%.0f", currentPct), "threshold": "warning"},
 				})
 			}
 
 			if prevPct-currentPct >= 10 {
-				sendNotification("event", eventParams{
-					Event: pluginEvent{
-						Type:      "usage.decreased",
-						PluginID:  pluginID,
-						Message:   fmt.Sprintf("%s usage dropped from %.0f%% to %.0f%%", displayName, prevPct, currentPct),
-						Severity:  "info",
-						Data:      map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "previous": fmt.Sprintf("%.0f", prevPct), "current": fmt.Sprintf("%.0f", currentPct)},
-						Timestamp: now,
-					},
+				sdk.Emit(sdk.Event{
+					Type:     "usage.decreased",
+					Message:  fmt.Sprintf("%s usage dropped from %.0f%% to %.0f%%", displayName, prevPct, currentPct),
+					Severity: sdk.SeverityInfo,
+					Data:     map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "previous": fmt.Sprintf("%.0f", prevPct), "current": fmt.Sprintf("%.0f", currentPct)},
 				})
 			}
 
 			if currentPct-prevPct >= 10 && currentPct < warnThreshold {
-				sendNotification("event", eventParams{
-					Event: pluginEvent{
-						Type:      "usage.increased",
-						PluginID:  pluginID,
-						Message:   fmt.Sprintf("%s usage rose from %.0f%% to %.0f%%", displayName, prevPct, currentPct),
-						Severity:  "info",
-						Data:      map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "previous": fmt.Sprintf("%.0f", prevPct), "current": fmt.Sprintf("%.0f", currentPct)},
-						Timestamp: now,
-					},
+				sdk.Emit(sdk.Event{
+					Type:     "usage.increased",
+					Message:  fmt.Sprintf("%s usage rose from %.0f%% to %.0f%%", displayName, prevPct, currentPct),
+					Severity: sdk.SeverityInfo,
+					Data:     map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "previous": fmt.Sprintf("%.0f", prevPct), "current": fmt.Sprintf("%.0f", currentPct)},
 				})
 			}
 		}
@@ -2355,7 +2216,7 @@ func (p *aiProviderPlugin) emitProviderEvents(results map[string]fetchResult) {
 	}
 }
 
-func (p *aiProviderPlugin) buildSnapshot() pluginSnapshot {
+func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 	allProviders := getAllProviders()
 	enabledIDs := p.config.EnabledProviders
 
@@ -2428,7 +2289,7 @@ func (p *aiProviderPlugin) buildSnapshot() pluginSnapshot {
 				}
 			}()
 			if !j.hasAuth {
-				logDebug("provider %s no auth, skipping fetch", j.key)
+				sdk.Log("provider %s no auth, skipping fetch", j.key)
 				resultCh <- struct {
 					id  string
 					res fetchResult
@@ -2443,7 +2304,7 @@ func (p *aiProviderPlugin) buildSnapshot() pluginSnapshot {
 				return
 			}
 
-			logDebug("provider %s starting fetch", j.key)
+			sdk.Log("provider %s starting fetch", j.key)
 			reqCtx, reqCancel := context.WithTimeout(ctx, 20*time.Second)
 			defer reqCancel()
 
@@ -2480,7 +2341,7 @@ func (p *aiProviderPlugin) buildSnapshot() pluginSnapshot {
 			}
 
 			if err != nil {
-				logDebug("provider %s fetch error: %v", j.key, err)
+				sdk.Log("provider %s fetch error: %v", j.key, err)
 				resultCh <- struct {
 					id  string
 					res fetchResult
@@ -2498,7 +2359,7 @@ func (p *aiProviderPlugin) buildSnapshot() pluginSnapshot {
 				}}
 				return
 			}
-			logDebug("provider %s fetch done health=%s", j.key, status.Health)
+			sdk.Log("provider %s fetch done health=%s", j.key, status.Health)
 			resultCh <- struct {
 				id  string
 				res fetchResult
@@ -2506,31 +2367,31 @@ func (p *aiProviderPlugin) buildSnapshot() pluginSnapshot {
 		}(job)
 	}
 
-	logDebug("waiting for %d provider results", len(jobs))
+	sdk.Log("waiting for %d provider results", len(jobs))
 	for range jobs {
 		r := <-resultCh
 		results[r.id] = r.res
 	}
-	logDebug("all provider results received")
+	sdk.Log("all provider results received")
 
 	// Emit events for threshold crosses and provider state changes
 	p.emitProviderEvents(results)
 
 	// If no providers enabled at all
 	if len(jobs) == 0 {
-		return pluginSnapshot{
+		return sdk.Snapshot{
 			PluginID: pluginID,
-			State:    "degraded",
-			Summary:  pluginSummary{Title: "AI Providers", Value: "No providers enabled", Trend: "steady", Severity: "info", IconHint: "brain.head.profile"},
-			Items:    []pluginItem{},
-			Actions: []pluginAction{
+			State:    sdk.StateDegraded,
+			Summary:  sdk.Summary{Title: "AI Providers", Value: "No providers enabled", Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "brain.head.profile"},
+			Items:    []sdk.Item{},
+			Actions: []sdk.Action{
 				{ID: "open_settings", Label: "Open Settings"},
 			},
-			Alerts: []pluginAlert{
-				{ID: "ai-no-providers", Severity: "info", Message: "No AI providers are enabled in plugin settings."},
+			Alerts: []sdk.Alert{
+				{ID: "ai-no-providers", Severity: sdk.SeverityInfo, Message: "No AI providers are enabled in plugin settings."},
 			},
 			RefreshAfter: 300,
-			Health:       "degraded",
+			Health:       sdk.HealthDegraded,
 		}
 	}
 
@@ -2559,53 +2420,53 @@ func (p *aiProviderPlugin) buildSnapshot() pluginSnapshot {
 	winner := selectWinner(cards)
 
 	// Build snapshot from winner
-	var summary pluginSummary
+	var summary sdk.Summary
 	var health string
 	var state string
-	var alerts = make([]pluginAlert, 0)
-	items := make([]pluginItem, 0, len(cards))
+	var alerts = make([]sdk.Alert, 0)
+	items := make([]sdk.Item, 0, len(cards))
 
 	if allAuthMissing && len(jobs) > 0 {
-		summary = pluginSummary{
-			Title: "AI Providers", Value: "AI auth", Trend: "steady", Severity: "info", IconHint: "brain.head.profile",
+		summary = sdk.Summary{
+			Title: "AI Providers", Value: "AI auth", Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "brain.head.profile",
 		}
-		health = "auth_required"
-		state = "degraded"
-		alerts = append(alerts, pluginAlert{
-			ID: "ai-auth-required", Severity: "warning", Message: "AI provider credentials are missing. Set up auth in Settings.",
+		health = sdk.HealthAuthReq
+		state = sdk.StateDegraded
+		alerts = append(alerts, sdk.Alert{
+			ID: "ai-auth-required", Severity: sdk.SeverityWarning, Message: "AI provider credentials are missing. Set up auth in Settings.",
 		})
 	} else if allErrored && len(jobs) > 0 {
-		summary = pluginSummary{
-			Title: "AI Providers", Value: "AI unavailable", Trend: "steady", Severity: "warning", IconHint: "brain.head.profile",
+		summary = sdk.Summary{
+			Title: "AI Providers", Value: "AI unavailable", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "brain.head.profile",
 		}
-		health = "error"
-		state = "degraded"
-		alerts = append(alerts, pluginAlert{
-			ID: "ai-all-error", Severity: "warning", Message: "All AI provider fetches failed. Check network and credentials.",
+		health = sdk.HealthError
+		state = sdk.StateDegraded
+		alerts = append(alerts, sdk.Alert{
+			ID: "ai-all-error", Severity: sdk.SeverityWarning, Message: "All AI provider fetches failed. Check network and credentials.",
 		})
 	} else if winner.HasData {
-		summary = pluginSummary{
+		summary = sdk.Summary{
 			Title:    effectiveDisplayName(winner.ProviderStatus),
 			Value:    winner.SummaryValue,
-			Trend:    "steady",
+			Trend:    sdk.TrendSteady,
 			Severity: winner.Severity,
 			IconHint: "brain.head.profile",
 		}
-		health = "ok"
-		state = "ready"
+		health = sdk.HealthOK
+		state = sdk.StateReady
 	} else if hasAnyLive {
 		// We have some live providers but no clear winner with data
-		summary = pluginSummary{
-			Title: "AI Providers", Value: "Connected", Trend: "steady", Severity: "info", IconHint: "brain.head.profile",
+		summary = sdk.Summary{
+			Title: "AI Providers", Value: "Connected", Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "brain.head.profile",
 		}
-		health = "ok"
-		state = "ready"
+		health = sdk.HealthOK
+		state = sdk.StateReady
 	} else {
-		summary = pluginSummary{
-			Title: "AI Providers", Value: "Loading", Trend: "steady", Severity: "info", IconHint: "brain.head.profile",
+		summary = sdk.Summary{
+			Title: "AI Providers", Value: "Loading", Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "brain.head.profile",
 		}
-		health = "degraded"
-		state = "degraded"
+		health = sdk.HealthDegraded
+		state = sdk.StateDegraded
 	}
 
 	// Build items
@@ -2617,27 +2478,27 @@ func (p *aiProviderPlugin) buildSnapshot() pluginSnapshot {
 	for _, card := range cards {
 		if card.Health == "ready" {
 			if card.Severity == "critical" {
-				alerts = append(alerts, pluginAlert{
+				alerts = append(alerts, sdk.Alert{
 					ID:       "ai-" + card.ProviderID + "-critical",
-					Severity: "critical",
+					Severity: sdk.SeverityCritical,
 					Message:  fmt.Sprintf("%s usage is at %.0f%% (critical threshold)", card.DisplayName, card.UsagePercent),
 				})
 			} else if card.Severity == "warning" {
-				alerts = append(alerts, pluginAlert{
+				alerts = append(alerts, sdk.Alert{
 					ID:       "ai-" + card.ProviderID + "-warning",
-					Severity: "warning",
+					Severity: sdk.SeverityWarning,
 					Message:  fmt.Sprintf("%s usage is at %.0f%% (warning threshold)", card.DisplayName, card.UsagePercent),
 				})
 			}
 		}
 	}
 
-	snapshot := pluginSnapshot{
+	snapshot := sdk.Snapshot{
 		PluginID: pluginID,
 		State:    state,
 		Summary:  summary,
 		Items:    items,
-		Actions: []pluginAction{
+		Actions: []sdk.Action{
 			{ID: "refresh", Label: "Refresh"},
 			{ID: "open_settings", Label: "Open Settings"},
 		},
@@ -2705,7 +2566,7 @@ func selectWinner(cards []ProviderStatus) providerWithData {
 	return providerWithData{ProviderStatus: live[0], HasData: true}
 }
 
-func cardToItem(p ProviderStatus) pluginItem {
+func cardToItem(p ProviderStatus) sdk.Item {
 	severity := p.Severity
 	if p.Health == "auth_required" {
 		severity = "info"
@@ -2749,7 +2610,7 @@ func cardToItem(p ProviderStatus) pluginItem {
 		itemID = itemID + "-" + p.AccountID
 	}
 
-	return pluginItem{
+	return sdk.Item{
 		ID:        itemID,
 		Title:     title,
 		Subtitle:  subtitle,
@@ -2757,7 +2618,7 @@ func cardToItem(p ProviderStatus) pluginItem {
 		Severity:  severity,
 		Timestamp: p.Timestamp.Format(time.RFC3339),
 		DeepLink:  p.DeepLink,
-		Actions:   []pluginAction{{ID: "open_" + p.ProviderID, Label: actionLabel}},
+		Actions:   []sdk.Action{{ID: "open_" + p.ProviderID, Label: actionLabel}},
 		Metadata: map[string]string{
 			"providerId":   p.ProviderID,
 			"displayName":  p.DisplayName,
@@ -2769,72 +2630,13 @@ func cardToItem(p ProviderStatus) pluginItem {
 	}
 }
 
-// --- Main ---
+// --- SDK handler ---
 
-func main() {
-	fmt.Fprintln(os.Stderr, "[ai-provider-plugin] process started")
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "[ai-provider-plugin] panic: %v\n", r)
-		}
-	}()
-
-	pl := &aiProviderPlugin{
-		client:       &http.Client{Timeout: 12 * time.Second},
-		config:       defaultConfig(),
-		providerAuth: make(map[string][]AuthContext),
-		prevUsage:    make(map[string]float64),
-	}
-	logDebug("started")
-
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	fmt.Fprintln(os.Stderr, "[ai-provider-plugin] waiting for stdin...")
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			logDebug("decode request failed: %v", err)
-			continue
-		}
-		logDebug("parsed method=%s id=%d", req.Method, req.ID)
-
-		switch req.Method {
-		case "initialize":
-			if err := pl.handleInitialize(req); err != nil {
-				logDebug("initialize failed: %v", err)
-				sendError(req.ID, -32000, err.Error(), false, "Check AI provider credentials in Settings")
-			}
-		case "getStatus", "refresh":
-			logDebug("building snapshot")
-			sendResult(req.ID, pl.buildSnapshot())
-		case "shutdown":
-			logDebug("shutdown")
-			sendResult(req.ID, nil)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "[ai-provider-plugin] scanner error: %v\n", err)
-	}
-	fmt.Fprintln(os.Stderr, "[ai-provider-plugin] scanner loop exited")
-}
-
-func (p *aiProviderPlugin) handleInitialize(req rpcRequest) error {
-	var params initializeParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return fmt.Errorf("decode initialize: %w", err)
-	}
-
-	plugindebug.ConfigureFromInitializeConfig(params.Config)
+func (p *aiProviderPlugin) Initialize(params sdk.InitializeParams) string {
 	p.config = parseConfig(params.Config)
-
 	p.providerAuth = make(map[string][]AuthContext)
 
-	// Process new multi-provider auth (accumulate multiple accounts per provider)
+	// Process multi-provider auth (accumulate multiple accounts per provider)
 	for _, pa := range params.ProviderAuths {
 		ac := AuthContext{
 			ProviderID:   pa.ProviderID,
@@ -2847,64 +2649,35 @@ func (p *aiProviderPlugin) handleInitialize(req rpcRequest) error {
 			DisplayName:  pa.DisplayName,
 		}
 		p.providerAuth[pa.ProviderID] = append(p.providerAuth[pa.ProviderID], ac)
-		logDebug("auth provider=%s account=%s kind=%s hasToken=%t hasKey=%t hasCookie=%t",
+		sdk.Log("auth provider=%s account=%s kind=%s hasToken=%t hasKey=%t hasCookie=%t",
 			pa.ProviderID, pa.AccountID, pa.Kind, pa.AccessToken != "", pa.APIKey != "", pa.CookieHeader != "")
 	}
 
-	logDebug("initialize config enabledProviders=%v", p.config.EnabledProviders)
-	sendResult(req.ID, initializedPayload{
-		Type:            "initialized",
-		ProtocolVersion: protocolVersion,
-		PluginVersion:   pluginVersion,
-		Health:          "ok",
-	})
-	return nil
+	sdk.Log("initialize config enabledProviders=%v", p.config.EnabledProviders)
+	return sdk.HealthOK
 }
 
-func sendResult(id int, result interface{}) {
-	logDebug("sending result id=%d", id)
-	resp := rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
-	enc := json.NewEncoder(os.Stdout)
-	if err := enc.Encode(resp); err != nil {
-		logDebug("json encode error: %v", err)
-		return
-	}
-	_ = os.Stdout.Sync()
+func (p *aiProviderPlugin) GetStatus() sdk.Snapshot {
+	sdk.Log("building snapshot")
+	return p.buildSnapshot()
 }
 
-func sendError(id int, code int, message string, retryable bool, suggestedAction string) {
-	logDebug("sending error id=%d code=%d message=%s", id, code, message)
-	resp := rpcResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &rpcError{
-			Code:    code,
-			Message: message,
-			Data:    &pluginErrorData{Retryable: retryable, SuggestedAction: suggestedAction},
-		},
-	}
-	enc := json.NewEncoder(os.Stdout)
-	if err := enc.Encode(resp); err != nil {
-		logDebug("json encode error: %v", err)
-		return
-	}
-	_ = os.Stdout.Sync()
+func (p *aiProviderPlugin) PerformAction(id string, params map[string]string) (bool, string) {
+	return false, "unknown action: " + id
 }
 
-func sendNotification(method string, params interface{}) {
-	notif := struct {
-		JSONRPC string      `json:"jsonrpc"`
-		Method  string      `json:"method"`
-		Params  interface{} `json:"params"`
-	}{
-		JSONRPC: "2.0",
-		Method:  method,
-		Params:  params,
+func (p *aiProviderPlugin) Shutdown() {
+	sdk.Log("shutdown")
+}
+
+// --- Main ---
+
+func main() {
+	pl := &aiProviderPlugin{
+		client:       &http.Client{Timeout: 12 * time.Second},
+		config:       defaultConfig(),
+		providerAuth: make(map[string][]AuthContext),
+		prevUsage:    make(map[string]float64),
 	}
-	enc := json.NewEncoder(os.Stdout)
-	if err := enc.Encode(notif); err != nil {
-		logDebug("json encode error: %v", err)
-		return
-	}
-	_ = os.Stdout.Sync()
+	sdk.Run(pluginID, pluginVersion, pl)
 }

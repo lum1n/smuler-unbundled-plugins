@@ -1,145 +1,29 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/lum1n/smuler/plugins/plugindebug"
+	sdk "github.com/lum1n/smuler/plugins/sdk-go"
 )
-
-func logDebug(format string, args ...interface{}) {
-	plugindebug.Log("[ci-github-actions-plugin]", format, args...)
-}
 
 const (
-	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.0"
-	apiBase         = "https://api.github.com"
-	pluginID        = "ci-github-actions"
-	maxConcurrency  = 5
-	maxRepos        = 30
-	maxRunsPerRepo  = 3
-	maxDisplayRuns  = 10
+	pluginID       = "ci-github-actions"
+	pluginVersion   = "0.1.1"
+	apiBase        = "https://api.github.com"
+	maxConcurrency = 5
+	maxRepos       = 30
+	maxRunsPerRepo = 3
+	maxDisplayRuns = 10
 )
-
-var initResult = initializedPayload{
-	Type:            "initialized",
-	ProtocolVersion: protocolVersion,
-	PluginVersion:   pluginVersion,
-	Health:          "ok",
-}
-
-// --- JSON-RPC types ---
-
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int              `json:"code"`
-	Message string           `json:"message"`
-	Data    *pluginErrorData `json:"data,omitempty"`
-}
-
-type pluginErrorData struct {
-	Retryable       bool   `json:"retryable"`
-	SuggestedAction string `json:"suggestedAction,omitempty"`
-}
-
-type initializeParams struct {
-	ProtocolVersion string                `json:"protocolVersion"`
-	PluginID        string                `json:"pluginId"`
-	Config          map[string]string     `json:"config"`
-	ProviderAuths   []providerAuthContext `json:"providerAuths"`
-}
-
-type providerAuthContext struct {
-	ProviderID string `json:"providerId"`
-	Kind       string `json:"kind"`
-	AccountID  string `json:"accountId,omitempty"`
-	TokenType  string `json:"tokenType,omitempty"`
-}
-
-type initializedPayload struct {
-	Type            string `json:"type"`
-	ProtocolVersion string `json:"protocolVersion"`
-	PluginVersion   string `json:"pluginVersion"`
-	Health          string `json:"health"`
-}
-
-type pluginSnapshot struct {
-	PluginID     string         `json:"pluginId"`
-	State        string         `json:"state"`
-	Summary      pluginSummary  `json:"summary"`
-	Items        []pluginItem   `json:"items"`
-	Actions      []pluginAction `json:"actions"`
-	Alerts       []pluginAlert  `json:"alerts"`
-	RefreshAfter int            `json:"refreshAfter"`
-	Health       string         `json:"health"`
-}
-
-type pluginSummary struct {
-	Title    string `json:"title"`
-	Value    string `json:"value"`
-	Trend    string `json:"trend"`
-	Severity string `json:"severity"`
-	IconHint string `json:"iconHint"`
-}
-
-type pluginItem struct {
-	ID        string         `json:"id"`
-	Title     string         `json:"title"`
-	Subtitle  string         `json:"subtitle,omitempty"`
-	Detail    string         `json:"detail,omitempty"`
-	Severity  string         `json:"severity"`
-	Timestamp string         `json:"timestamp,omitempty"`
-	DeepLink  string         `json:"deepLink,omitempty"`
-	Actions   []pluginAction `json:"actions"`
-}
-
-type pluginAction struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-}
-
-type pluginAlert struct {
-	ID       string `json:"id"`
-	Severity string `json:"severity"`
-	Message  string `json:"message"`
-}
-
-type pluginEvent struct {
-	Type      string            `json:"type"`
-	PluginID  string            `json:"pluginId"`
-	Message   string            `json:"message"`
-	Severity  string            `json:"severity"`
-	Data      map[string]string `json:"data"`
-	Timestamp string            `json:"timestamp"`
-}
-
-type eventParams struct {
-	Event pluginEvent `json:"event"`
-}
 
 // --- GitHub API types ---
 
@@ -159,9 +43,9 @@ type ghWorkflowRun struct {
 	CreatedAt  string      `json:"created_at"`
 	UpdatedAt  string      `json:"updated_at"`
 	HeadBranch string      `json:"head_branch"`
-	HeadSHA   string      `json:"head_sha"`
-	Event     string      `json:"event"`
-	RunNumber int         `json:"run_number"`
+	HeadSHA    string      `json:"head_sha"`
+	Event      string      `json:"event"`
+	RunNumber  int         `json:"run_number"`
 	Repository struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
@@ -188,13 +72,32 @@ type ciPlugin struct {
 	prevFailureCount int
 }
 
+func (p *ciPlugin) Initialize(params sdk.InitializeParams) string {
+	for _, auth := range params.ProviderAuths {
+		if auth.AccountID != "" {
+			p.token = auth.AccountID
+			break
+		}
+	}
+	if p.token == "" {
+		return sdk.HealthAuthReq
+	}
+	return sdk.HealthOK
+}
+
+func (p *ciPlugin) PerformAction(id string, params map[string]string) (bool, string) {
+	return false, "unknown action: " + id
+}
+
+func (p *ciPlugin) Shutdown() {}
+
 func (p *ciPlugin) apiRequest(ctx context.Context, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", apiBase+path, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "smuler-ci-github-actions-plugin/0.1.0")
+	req.Header.Set("User-Agent", "smuler-ci-github-actions-plugin/"+pluginVersion)
 	if p.token != "" {
 		req.Header.Set("Authorization", "token "+p.token)
 	}
@@ -240,17 +143,17 @@ func (p *ciPlugin) fetchRepoRuns(ctx context.Context, fullName string) ([]ghWork
 	return resp.WorkflowRuns, nil
 }
 
-func (p *ciPlugin) buildSnapshot() pluginSnapshot {
+func (p *ciPlugin) GetStatus() sdk.Snapshot {
 	if p.token == "" {
-		return pluginSnapshot{
-			PluginID: pluginID,
-			State:    "degraded",
-			Summary:  pluginSummary{Title: "GitHub Actions", Value: "No token configured", Trend: "steady", Severity: "info", IconHint: "workflow"},
-			Items:    []pluginItem{},
-			Actions:  []pluginAction{},
-			Alerts:   []pluginAlert{{ID: "gha-config", Severity: "info", Message: "No token configured"}},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateDegraded,
+			Summary:      sdk.Summary{Title: "GitHub Actions", Value: "No token configured", Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "workflow"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "gha-config", Severity: sdk.SeverityInfo, Message: "No token configured"}},
 			RefreshAfter: 300,
-			Health:   "auth_required",
+			Health:       sdk.HealthAuthReq,
 		}
 	}
 
@@ -260,15 +163,15 @@ func (p *ciPlugin) buildSnapshot() pluginSnapshot {
 	repos, err := p.fetchRepos(ctx)
 	if err != nil {
 		msg := fmt.Sprintf("API unreachable: %v", err)
-		return pluginSnapshot{
-			PluginID: pluginID,
-			State:    "degraded",
-			Summary:  pluginSummary{Title: "GitHub Actions", Value: msg, Trend: "steady", Severity: "info", IconHint: "workflow"},
-			Items:    []pluginItem{},
-			Actions:  []pluginAction{},
-			Alerts:   []pluginAlert{{ID: "gha-error", Severity: "info", Message: msg}},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateDegraded,
+			Summary:      sdk.Summary{Title: "GitHub Actions", Value: msg, Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "workflow"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "gha-error", Severity: sdk.SeverityInfo, Message: msg}},
 			RefreshAfter: 120,
-			Health:   "degraded",
+			Health:       sdk.HealthDegraded,
 		}
 	}
 
@@ -279,7 +182,7 @@ func (p *ciPlugin) buildSnapshot() pluginSnapshot {
 		return allRuns[i].CreatedAt > allRuns[j].CreatedAt
 	})
 
-	items := make([]pluginItem, 0, maxDisplayRuns)
+	items := make([]sdk.Item, 0, maxDisplayRuns)
 	for _, run := range allRuns {
 		if len(items) >= maxDisplayRuns {
 			break
@@ -296,19 +199,19 @@ func (p *ciPlugin) buildSnapshot() pluginSnapshot {
 			detail += " (" + shortSHA + ")"
 		}
 
-		items = append(items, pluginItem{
+		items = append(items, sdk.Item{
 			ID:        runID,
 			Title:     run.Name,
 			Subtitle:  subtitle,
 			Detail:    detail,
-			Severity:  "critical",
+			Severity:  sdk.SeverityCritical,
 			Timestamp: run.CreatedAt,
 			DeepLink:  run.HTMLURL,
-			Actions:   []pluginAction{{ID: "open", Label: "Open Run"}},
+			Actions:   []sdk.Action{{ID: "open", Label: "Open Run"}},
 		})
 	}
 
-	alerts := make([]pluginAlert, 0)
+	alerts := make([]sdk.Alert, 0)
 	failureCount := len(allRuns)
 
 	if failureCount > 0 {
@@ -316,35 +219,31 @@ func (p *ciPlugin) buildSnapshot() pluginSnapshot {
 		if failureCount == 1 {
 			s = ""
 		}
-		alerts = append(alerts, pluginAlert{
+		alerts = append(alerts, sdk.Alert{
 			ID:       "gha-failures",
-			Severity: "critical",
+			Severity: sdk.SeverityCritical,
 			Message:  fmt.Sprintf("%d workflow%s failing across %d repos", failureCount, s, countRepos(allRuns)),
 		})
 	}
 
-	var severity string
-	var value string
-	var health string
+	var severity, value string
 	if failureCount > 0 {
-		severity = "critical"
+		severity = sdk.SeverityCritical
 		value = fmt.Sprintf("%d failing", failureCount)
-		health = "ok"
 	} else {
-		severity = "info"
+		severity = sdk.SeverityInfo
 		value = "All passing"
-		health = "ok"
 	}
 
-	return pluginSnapshot{
+	return sdk.Snapshot{
 		PluginID:     pluginID,
-		State:        "ready",
-		Summary:      pluginSummary{Title: "Actions", Value: value, Trend: "steady", Severity: severity, IconHint: "workflow"},
+		State:        sdk.StateReady,
+		Summary:      sdk.Summary{Title: "Actions", Value: value, Trend: sdk.TrendSteady, Severity: severity, IconHint: "workflow"},
 		Items:        items,
-		Actions:      []pluginAction{{ID: "refresh", Label: "Refresh"}},
+		Actions:      []sdk.Action{{ID: "refresh", Label: "Refresh"}},
 		Alerts:       alerts,
 		RefreshAfter: 300,
-		Health:       health,
+		Health:       sdk.HealthOK,
 	}
 }
 
@@ -389,7 +288,7 @@ func (p *ciPlugin) fetchAllRuns(ctx context.Context, repos []ghRepo) []ghWorkflo
 	var allRuns []ghWorkflowRun
 	for res := range results {
 		if res.err != nil {
-			logDebug("repo fetch error: %v", res.err)
+			sdk.Log("repo fetch error: %v", res.err)
 			continue
 		}
 		allRuns = append(allRuns, res.runs...)
@@ -412,11 +311,11 @@ func (p *ciPlugin) emitDeltaEvents(runs []ghWorkflowRun) {
 
 	for key, info := range p.prevFails {
 		if _, ok := currentFails[key]; !ok && len(p.prevFails) > 0 {
-			p.emitEvent(pluginEvent{
+			sdk.Emit(sdk.Event{
 				Type:      "workflow.fixed",
 				PluginID:  pluginID,
 				Message:   fmt.Sprintf("Workflow %s is passing again", info.title),
-				Severity:  "info",
+				Severity:  sdk.SeverityInfo,
 				Data:      map[string]string{"runId": key, "title": info.title, "url": info.url},
 				Timestamp: now,
 			})
@@ -425,11 +324,11 @@ func (p *ciPlugin) emitDeltaEvents(runs []ghWorkflowRun) {
 
 	for key, info := range currentFails {
 		if _, ok := p.prevFails[key]; !ok && len(p.prevFails) > 0 {
-			p.emitEvent(pluginEvent{
+			sdk.Emit(sdk.Event{
 				Type:      "workflow.failed",
 				PluginID:  pluginID,
 				Message:   fmt.Sprintf("Workflow failed: %s", info.title),
-				Severity:  "critical",
+				Severity:  sdk.SeverityCritical,
 				Data:      map[string]string{"runId": key, "title": info.title, "url": info.url},
 				Timestamp: now,
 			})
@@ -439,20 +338,20 @@ func (p *ciPlugin) emitDeltaEvents(runs []ghWorkflowRun) {
 	failureCount := len(currentFails)
 	if failureCount != p.prevFailureCount && len(p.prevFails) > 0 {
 		if failureCount > p.prevFailureCount {
-			p.emitEvent(pluginEvent{
+			sdk.Emit(sdk.Event{
 				Type:      "failure.count_increased",
 				PluginID:  pluginID,
 				Message:   fmt.Sprintf("Failing workflows increased from %d to %d", p.prevFailureCount, failureCount),
-				Severity:  "critical",
+				Severity:  sdk.SeverityCritical,
 				Data:      map[string]string{"previous": strconv.Itoa(p.prevFailureCount), "current": strconv.Itoa(failureCount)},
 				Timestamp: now,
 			})
 		} else if failureCount < p.prevFailureCount {
-			p.emitEvent(pluginEvent{
+			sdk.Emit(sdk.Event{
 				Type:      "failure.count_decreased",
 				PluginID:  pluginID,
 				Message:   fmt.Sprintf("Failing workflows decreased from %d to %d", p.prevFailureCount, failureCount),
-				Severity:  "info",
+				Severity:  sdk.SeverityInfo,
 				Data:      map[string]string{"previous": strconv.Itoa(p.prevFailureCount), "current": strconv.Itoa(failureCount)},
 				Timestamp: now,
 			})
@@ -463,102 +362,9 @@ func (p *ciPlugin) emitDeltaEvents(runs []ghWorkflowRun) {
 	p.prevFailureCount = failureCount
 }
 
-func (p *ciPlugin) emitEvent(event pluginEvent) {
-	event.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	params := eventParams{Event: event}
-	payload, err := json.Marshal(params)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	out := fmt.Sprintf(`{"jsonrpc":"2.0","method":"event","params":%s}`, string(payload))
-	fmt.Fprintf(os.Stdout, "%s\n", out)
-}
-
-func sendResult(id int, result interface{}) {
-	resp := rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
-}
-
-func sendError(id int, code int, message string, retryable bool, suggestedAction string) {
-	resp := rpcResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &rpcError{
-			Code:    code,
-			Message: message,
-			Data:    &pluginErrorData{Retryable: retryable, SuggestedAction: suggestedAction},
-		},
-	}
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
-}
-
 func main() {
-	defer func() {
-		if r := recover(); r != nil {
-			logDebug("panic: %v", r)
-		}
-	}()
-
-	pl := &ciPlugin{
+	sdk.Run(pluginID, pluginVersion, &ciPlugin{
 		client:    &http.Client{Timeout: 30 * time.Second},
 		prevFails: make(map[string]prevFailInfo),
-	}
-
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(nil, 2*1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			continue
-		}
-
-		switch req.Method {
-		case "initialize":
-			var params initializeParams
-			if err := json.Unmarshal(req.Params, &params); err == nil {
-				plugindebug.ConfigureFromInitializeConfig(params.Config)
-				for _, auth := range params.ProviderAuths {
-					if auth.AccountID != "" {
-						pl.token = auth.AccountID
-						break
-					}
-				}
-			}
-			sendResult(req.ID, initResult)
-
-		case "getStatus":
-			sendResult(req.ID, pl.buildSnapshot())
-
-		case "refresh":
-			sendResult(req.ID, pl.buildSnapshot())
-
-		case "shutdown":
-			sendResult(req.ID, nil)
-			return
-
-		default:
-			sendError(req.ID, -32601, fmt.Sprintf("unknown method: %s", req.Method), false, "")
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		logDebug("stdin scanner error: %v", err)
-	}
+	})
 }

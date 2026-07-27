@@ -1,177 +1,29 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lum1n/smuler/plugins/httphealth"
-	"github.com/lum1n/smuler/plugins/plugindebug"
+	sdk "github.com/lum1n/smuler/plugins/sdk-go"
 )
-
-func logDebug(format string, args ...interface{}) {
-	plugindebug.Log("[github-plugin]", format, args...)
-}
 
 const (
-	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.1"
-	apiBase         = "https://api.github.com"
+	pluginID      = "github"
+	pluginVersion   = "0.1.2"
+	apiBase       = "https://api.github.com"
 )
-
-// --- JSON-RPC types ---
-
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int              `json:"code"`
-	Message string           `json:"message"`
-	Data    *pluginErrorData `json:"data,omitempty"`
-}
-
-type pluginErrorData struct {
-	Retryable       bool   `json:"retryable"`
-	SuggestedAction string `json:"suggestedAction,omitempty"`
-}
-
-type initializeParams struct {
-	ProtocolVersion string                `json:"protocolVersion"`
-	PluginID        string                `json:"pluginId"`
-	Config          map[string]string     `json:"config"`
-	Auth            *pluginAuthContext    `json:"auth,omitempty"`
-	ProviderAuths   []providerAuthContext `json:"providerAuths,omitempty"`
-}
-
-type pluginAuthContext struct {
-	AccountID string `json:"accountId"`
-}
-
-type providerAuthContext struct {
-	ProviderID  string `json:"providerId"`
-	Kind        string `json:"kind"`
-	AccountID   string `json:"accountId,omitempty"`
-	AccessToken string `json:"accessToken,omitempty"`
-}
-
-type initializedPayload struct {
-	Type            string `json:"type"`
-	ProtocolVersion string `json:"protocolVersion"`
-	PluginVersion   string `json:"pluginVersion"`
-	Health          string `json:"health"`
-}
-
-type pluginSnapshot struct {
-	PluginID     string         `json:"pluginId"`
-	State        string         `json:"state"`
-	Summary      pluginSummary  `json:"summary"`
-	Items        []pluginItem   `json:"items"`
-	Actions      []pluginAction `json:"actions"`
-	Alerts       []pluginAlert  `json:"alerts"`
-	RefreshAfter int            `json:"refreshAfter"`
-	Health       string         `json:"health"`
-}
-
-type pluginSummary struct {
-	Title    string `json:"title"`
-	Value    string `json:"value"`
-	Trend    string `json:"trend"`
-	Severity string `json:"severity"`
-	IconHint string `json:"iconHint"`
-}
-
-type pluginItem struct {
-	ID        string         `json:"id"`
-	Title     string         `json:"title"`
-	Subtitle  string         `json:"subtitle,omitempty"`
-	Detail    string         `json:"detail,omitempty"`
-	Severity  string         `json:"severity"`
-	Timestamp string         `json:"timestamp,omitempty"`
-	DeepLink  string         `json:"deepLink,omitempty"`
-	Actions   []pluginAction `json:"actions"`
-}
-
-type pluginAction struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-}
-
-type pluginAlert struct {
-	ID       string `json:"id"`
-	Severity string `json:"severity"`
-	Message  string `json:"message"`
-}
-
-type performActionResult struct {
-	Success bool            `json:"success"`
-	Data    string          `json:"data,omitempty"`
-	Error   string          `json:"error,omitempty"`
-	Window  *pluginWindow   `json:"window,omitempty"`
-	AI      *pluginAIAssist `json:"ai,omitempty"`
-}
-
-type pluginWindow struct {
-	ID       string                `json:"id"`
-	Title    string                `json:"title"`
-	Subtitle string                `json:"subtitle,omitempty"`
-	IconHint string                `json:"iconHint,omitempty"`
-	Sections []pluginWindowSection `json:"sections"`
-}
-
-type pluginWindowSection struct {
-	ID     string              `json:"id"`
-	Title  string              `json:"title,omitempty"`
-	Blocks []pluginWindowBlock `json:"blocks"`
-}
-
-type pluginWindowBlock struct {
-	ID    string `json:"id"`
-	Text  string `json:"text"`
-	Style string `json:"style,omitempty"`
-}
-
-type pluginAIAssist struct {
-	Task         string `json:"task"`
-	Input        string `json:"input"`
-	WindowID     string `json:"windowId"`
-	SectionTitle string `json:"sectionTitle,omitempty"`
-}
-
-type pluginEvent struct {
-	Type      string            `json:"type"`
-	PluginID  string            `json:"pluginId"`
-	Message   string            `json:"message"`
-	Severity  string            `json:"severity"`
-	Data      map[string]string `json:"data"`
-	Timestamp string            `json:"timestamp"`
-}
-
-type eventParams struct {
-	Event pluginEvent `json:"event"`
-}
 
 // --- GitHub API types ---
 
 type ghSearchResponse struct {
-	TotalCount int      `json:"total_count"`
-	Items      []ghPR   `json:"items"`
+	TotalCount int    `json:"total_count"`
+	Items      []ghPR `json:"items"`
 }
 
 type ghPR struct {
@@ -204,14 +56,59 @@ type prMeta struct {
 }
 
 type githubPlugin struct {
-	token  string
-	client *http.Client
+	token   string
+	client  *http.Client
 	apiBase string
 
 	prevPRs         map[string]prevPRInfo // pr-N -> info
 	prevReviewCount int
 	prMetaMap       map[string]prMeta // itemID -> metadata for getMRDiff
 }
+
+func (p *githubPlugin) Initialize(params sdk.InitializeParams) string {
+	for _, auth := range params.ProviderAuths {
+		if auth.AccountID != "" {
+			p.token = auth.AccountID
+			break
+		}
+		if auth.AccessToken != "" {
+			p.token = auth.AccessToken
+			break
+		}
+	}
+	if p.token == "" && params.Auth != nil && params.Auth.AccountID != "" {
+		p.token = params.Auth.AccountID
+	}
+	if p.token == "" {
+		return sdk.HealthAuthReq
+	}
+	return sdk.HealthOK
+}
+
+func (p *githubPlugin) GetStatus() sdk.Snapshot {
+	return p.buildSnapshot()
+}
+
+func (p *githubPlugin) PerformAction(id string, params map[string]string) (bool, string) {
+	return false, "use PerformActionResult"
+}
+
+func (p *githubPlugin) PerformActionResult(id string, params map[string]string) sdk.ActionResult {
+	switch id {
+	case "getMRDiff":
+		success, data := p.handleGetMRDiff(strings.TrimSpace(params["id"]))
+		if !success {
+			return sdk.ActionFail(data)
+		}
+		return sdk.ActionOK(data)
+	case "summarize":
+		return p.handleSummarize(strings.TrimSpace(params["id"]))
+	default:
+		return sdk.ActionFail(fmt.Sprintf("unknown action: %s", id))
+	}
+}
+
+func (p *githubPlugin) Shutdown() {}
 
 func (p *githubPlugin) apiBaseURL() string {
 	if p.apiBase != "" {
@@ -240,7 +137,7 @@ func (p *githubPlugin) apiRequestRaw(path string, acceptHeader string) (httpResp
 	} else {
 		req.Header.Set("Accept", "application/vnd.github.v3+json")
 	}
-	req.Header.Set("User-Agent", "smuler-github-plugin/0.1.1")
+	req.Header.Set("User-Agent", "smuler-github-plugin/"+pluginVersion)
 	if p.token != "" {
 		req.Header.Set("Authorization", "token "+p.token)
 	}
@@ -290,75 +187,64 @@ func (p *githubPlugin) handleGetMRDiff(idStr string) (bool, string) {
 	return true, diff
 }
 
-func (p *githubPlugin) handleSummarize(idStr string) *performActionResult {
+func (p *githubPlugin) handleSummarize(idStr string) sdk.ActionResult {
 	meta, ok := p.prMetaMap[idStr]
 	if !ok {
-		return &performActionResult{Success: false, Error: fmt.Sprintf("PR not found in cache: %s", idStr)}
+		return sdk.ActionFail(fmt.Sprintf("PR not found in cache: %s", idStr))
 	}
 
 	diff, err := p.fetchPRDiff(meta.repo, meta.number)
 	if err != nil {
-		return &performActionResult{Success: false, Error: fmt.Sprintf("Failed to fetch diff: %v", err)}
+		return sdk.ActionFail(fmt.Sprintf("Failed to fetch diff: %v", err))
 	}
 	if strings.TrimSpace(diff) == "" {
-		return &performActionResult{Success: false, Error: "Empty diff"}
+		return sdk.ActionFail("Empty diff")
 	}
 
 	title := meta.title
 	if title == "" {
 		title = fmt.Sprintf("PR #%d", meta.number)
 	}
-	windowID := fmt.Sprintf("github.summarize.%s", idStr)
-	return &performActionResult{
-		Success: true,
-		Window: &pluginWindow{
-			ID:       windowID,
-			Title:    title,
-			Subtitle: "GitHub",
-			IconHint: "arrow.triangle.pull",
-			Sections: []pluginWindowSection{{
-				ID:    "loading",
-				Title: "Summary",
-				Blocks: []pluginWindowBlock{{
-					ID:    "generating",
-					Text:  "Generating summary...",
-					Style: "paragraph",
-				}},
-			}},
-		},
-		AI: &pluginAIAssist{
-			Task:         "summarize_bullets",
-			Input:        diff,
-			WindowID:     windowID,
-			SectionTitle: "Summary",
-		},
-	}
+	return sdk.ActionAITask(sdk.AIWindowOpts{
+		ID:       fmt.Sprintf("github.summarize.%s", idStr),
+		Title:    title,
+		Subtitle: "GitHub",
+		IconHint: "arrow.triangle.pull",
+		Task:     sdk.AITaskSummarizeBullets,
+		Input:    diff,
+	})
 }
 
-func (p *githubPlugin) buildSnapshot() pluginSnapshot {
+func (p *githubPlugin) buildSnapshot() sdk.Snapshot {
 	if p.token == "" {
-		return pluginSnapshot{
-			PluginID:     "github",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "GitHub", Value: "No token configured", Trend: "steady", Severity: "info", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{{ID: "github-config", Severity: "info", Message: "No token configured"}},
+		return sdk.Snapshot{
+			PluginID: pluginID,
+			State:    sdk.StateDegraded,
+			Summary: sdk.Summary{
+				Title: "GitHub", Value: "No token configured", Trend: sdk.TrendSteady,
+				Severity: sdk.SeverityInfo, IconHint: "pull-request",
+			},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "github-config", Severity: sdk.SeverityInfo, Message: "No token configured"}},
 			RefreshAfter: 300,
-			Health:       "auth_required",
+			Health:       sdk.HealthAuthReq,
 		}
 	}
 
 	body, err := p.apiRequest("/search/issues?q=is:pr+is:open+review-requested:@me+archived:false&per_page=5&sort=updated&order=desc")
 	if err != nil {
 		msg := fmt.Sprintf("API unreachable: %v", err)
-		return pluginSnapshot{
-			PluginID:     "github",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "GitHub", Value: msg, Trend: "steady", Severity: "info", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{{ID: "github-error", Severity: "info", Message: msg}},
+		return sdk.Snapshot{
+			PluginID: pluginID,
+			State:    sdk.StateDegraded,
+			Summary: sdk.Summary{
+				Title: "GitHub", Value: msg, Trend: sdk.TrendSteady,
+				Severity: sdk.SeverityInfo, IconHint: "pull-request",
+			},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "github-error", Severity: sdk.SeverityInfo, Message: msg}},
 			RefreshAfter: httphealth.DefaultRefreshAfter(httphealth.HealthDegraded, 0),
 			Health:       httphealth.HealthDegraded,
 		}
@@ -366,13 +252,16 @@ func (p *githubPlugin) buildSnapshot() pluginSnapshot {
 
 	if body.StatusCode == http.StatusUnauthorized || body.StatusCode == http.StatusForbidden {
 		msg := "GitHub authentication failed — reconnect in Settings"
-		return pluginSnapshot{
-			PluginID:     "github",
-			State:        "error",
-			Summary:      pluginSummary{Title: "GitHub", Value: "Auth required", Trend: "steady", Severity: "warning", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{{ID: "github-auth", Severity: "warning", Message: msg}},
+		return sdk.Snapshot{
+			PluginID: pluginID,
+			State:    sdk.StateError,
+			Summary: sdk.Summary{
+				Title: "GitHub", Value: "Auth required", Trend: sdk.TrendSteady,
+				Severity: sdk.SeverityWarning, IconHint: "pull-request",
+			},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "github-auth", Severity: sdk.SeverityWarning, Message: msg}},
 			RefreshAfter: httphealth.DefaultRefreshAfter(httphealth.HealthAuthReq, body.RetryAfter),
 			Health:       httphealth.HealthAuthReq,
 		}
@@ -380,13 +269,16 @@ func (p *githubPlugin) buildSnapshot() pluginSnapshot {
 
 	if body.StatusCode == http.StatusTooManyRequests {
 		msg := "GitHub API rate limited"
-		return pluginSnapshot{
-			PluginID:     "github",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "GitHub", Value: "Rate limited", Trend: "steady", Severity: "warning", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{{ID: "github-rate-limit", Severity: "warning", Message: msg}},
+		return sdk.Snapshot{
+			PluginID: pluginID,
+			State:    sdk.StateDegraded,
+			Summary: sdk.Summary{
+				Title: "GitHub", Value: "Rate limited", Trend: sdk.TrendSteady,
+				Severity: sdk.SeverityWarning, IconHint: "pull-request",
+			},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "github-rate-limit", Severity: sdk.SeverityWarning, Message: msg}},
 			RefreshAfter: httphealth.DefaultRefreshAfter(httphealth.HealthRateLimited, body.RetryAfter),
 			Health:       httphealth.HealthRateLimited,
 		}
@@ -395,13 +287,16 @@ func (p *githubPlugin) buildSnapshot() pluginSnapshot {
 	if body.StatusCode < 200 || body.StatusCode >= 300 {
 		msg := fmt.Sprintf("GitHub API error (%d)", body.StatusCode)
 		health := httphealth.ClassifyHTTPStatus(body.StatusCode)
-		return pluginSnapshot{
-			PluginID:     "github",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "GitHub", Value: msg, Trend: "steady", Severity: "warning", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{{ID: "github-error", Severity: "warning", Message: msg}},
+		return sdk.Snapshot{
+			PluginID: pluginID,
+			State:    sdk.StateDegraded,
+			Summary: sdk.Summary{
+				Title: "GitHub", Value: msg, Trend: sdk.TrendSteady,
+				Severity: sdk.SeverityWarning, IconHint: "pull-request",
+			},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "github-error", Severity: sdk.SeverityWarning, Message: msg}},
 			RefreshAfter: httphealth.DefaultRefreshAfter(health, body.RetryAfter),
 			Health:       health,
 		}
@@ -410,15 +305,18 @@ func (p *githubPlugin) buildSnapshot() pluginSnapshot {
 	var searchResp ghSearchResponse
 	if err := json.Unmarshal(body.Body, &searchResp); err != nil {
 		msg := fmt.Sprintf("Failed to parse API response: %v", err)
-		return pluginSnapshot{
-			PluginID:     "github",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "GitHub", Value: msg, Trend: "steady", Severity: "warning", IconHint: "pull-request"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{},
-			Alerts:       []pluginAlert{{ID: "github-parse", Severity: "warning", Message: msg}},
+		return sdk.Snapshot{
+			PluginID: pluginID,
+			State:    sdk.StateDegraded,
+			Summary: sdk.Summary{
+				Title: "GitHub", Value: msg, Trend: sdk.TrendSteady,
+				Severity: sdk.SeverityWarning, IconHint: "pull-request",
+			},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "github-parse", Severity: sdk.SeverityWarning, Message: msg}},
 			RefreshAfter: 120,
-			Health:       "degraded",
+			Health:       sdk.HealthDegraded,
 		}
 	}
 
@@ -430,18 +328,18 @@ func (p *githubPlugin) buildSnapshot() pluginSnapshot {
 	var severity string
 	var value string
 	if reviewCount > 0 {
-		severity = "warning"
+		severity = sdk.SeverityWarning
 		s := "s"
 		if reviewCount == 1 {
 			s = ""
 		}
 		value = fmt.Sprintf("%d review%s", reviewCount, s)
 	} else {
-		severity = "info"
+		severity = sdk.SeverityInfo
 		value = "No reviews"
 	}
 
-	items := make([]pluginItem, 0, 3)
+	items := make([]sdk.Item, 0, 3)
 	for _, pr := range itemsData {
 		if len(items) >= 3 {
 			break
@@ -453,7 +351,7 @@ func (p *githubPlugin) buildSnapshot() pluginSnapshot {
 			repo:   repo,
 			title:  pr.Title,
 		}
-		items = append(items, pluginItem{
+		items = append(items, sdk.Item{
 			ID:        itemID,
 			Title:     pr.Title,
 			Subtitle:  repo,
@@ -461,28 +359,31 @@ func (p *githubPlugin) buildSnapshot() pluginSnapshot {
 			Severity:  severity,
 			Timestamp: pr.CreatedAt,
 			DeepLink:  pr.HTMLURL,
-			Actions:   []pluginAction{{ID: "open", Label: "Open PR"}, {ID: "summarize", Label: "Summarize"}},
+			Actions:   []sdk.Action{{ID: "open", Label: "Open PR"}, {ID: "summarize", Label: "Summarize"}},
 		})
 	}
 
-	alerts := make([]pluginAlert, 0)
+	alerts := make([]sdk.Alert, 0)
 	if reviewCount > 0 {
-		alerts = append(alerts, pluginAlert{
+		alerts = append(alerts, sdk.Alert{
 			ID:       "review-backlog",
-			Severity: "warning",
+			Severity: sdk.SeverityWarning,
 			Message:  fmt.Sprintf("%d review request(s) need attention", reviewCount),
 		})
 	}
 
-	return pluginSnapshot{
-		PluginID:     "github",
-		State:        "ready",
-		Summary:      pluginSummary{Title: "GitHub", Value: value, Trend: "steady", Severity: severity, IconHint: "pull-request"},
+	return sdk.Snapshot{
+		PluginID: pluginID,
+		State:    sdk.StateReady,
+		Summary: sdk.Summary{
+			Title: "GitHub", Value: value, Trend: sdk.TrendSteady,
+			Severity: severity, IconHint: "pull-request",
+		},
 		Items:        items,
-		Actions:      []pluginAction{{ID: "refresh", Label: "Refresh"}},
+		Actions:      []sdk.Action{{ID: "refresh", Label: "Refresh"}},
 		Alerts:       alerts,
 		RefreshAfter: 300,
-		Health:       "ok",
+		Health:       sdk.HealthOK,
 	}
 }
 
@@ -495,42 +396,39 @@ func (p *githubPlugin) emitDeltaEvents(items []ghPR, reviewCount int) {
 
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	// PRs that disappeared from review-requested list
 	for key, info := range p.prevPRs {
-		if _, ok := currentPRs[key]; !ok {
-			p.emitEvent(pluginEvent{
-				Type:     "pr.review_completed",
-				PluginID: "github",
-				Message:  fmt.Sprintf("Review completed for %s", key),
-				Severity: "info",
-				Data:     map[string]string{"prId": key, "url": info.url},
+		if _, still := currentPRs[key]; !still {
+			sdk.Emit(sdk.Event{
+				Type:      "pr.review_completed",
+				PluginID:  pluginID,
+				Message:   fmt.Sprintf("Review completed: %s", info.title),
+				Severity:  sdk.SeverityInfo,
+				Data:      map[string]string{"prId": key, "title": info.title, "url": info.url},
 				Timestamp: now,
 			})
 		}
 	}
 
-	// New PRs added to review-requested list
 	for key, info := range currentPRs {
-		if _, ok := p.prevPRs[key]; !ok && len(p.prevPRs) > 0 {
-			p.emitEvent(pluginEvent{
-				Type:     "pr.review_requested",
-				PluginID: "github",
-				Message:  fmt.Sprintf("Review requested: %s", info.title),
-				Severity: "warning",
-				Data:     map[string]string{"prId": key, "title": info.title, "url": info.url},
+		if _, was := p.prevPRs[key]; !was && len(p.prevPRs) > 0 {
+			sdk.Emit(sdk.Event{
+				Type:      "pr.review_requested",
+				PluginID:  pluginID,
+				Message:   fmt.Sprintf("Review requested: %s", info.title),
+				Severity:  sdk.SeverityWarning,
+				Data:      map[string]string{"prId": key, "title": info.title, "url": info.url},
 				Timestamp: now,
 			})
 		}
 	}
 
-	// Review count changed
 	if reviewCount != p.prevReviewCount && len(p.prevPRs) > 0 {
 		if reviewCount > p.prevReviewCount {
-			p.emitEvent(pluginEvent{
+			sdk.Emit(sdk.Event{
 				Type:     "pr.count_increased",
-				PluginID: "github",
+				PluginID: pluginID,
 				Message:  fmt.Sprintf("Review requests increased from %d to %d", p.prevReviewCount, reviewCount),
-				Severity: "warning",
+				Severity: sdk.SeverityWarning,
 				Data: map[string]string{
 					"previous": strconv.Itoa(p.prevReviewCount),
 					"current":  strconv.Itoa(reviewCount),
@@ -538,11 +436,11 @@ func (p *githubPlugin) emitDeltaEvents(items []ghPR, reviewCount int) {
 				Timestamp: now,
 			})
 		} else if reviewCount < p.prevReviewCount {
-			p.emitEvent(pluginEvent{
+			sdk.Emit(sdk.Event{
 				Type:     "pr.count_decreased",
-				PluginID: "github",
+				PluginID: pluginID,
 				Message:  fmt.Sprintf("Review requests decreased from %d to %d", p.prevReviewCount, reviewCount),
-				Severity: "info",
+				Severity: sdk.SeverityInfo,
 				Data: map[string]string{
 					"previous": strconv.Itoa(p.prevReviewCount),
 					"current":  strconv.Itoa(reviewCount),
@@ -556,138 +454,10 @@ func (p *githubPlugin) emitDeltaEvents(items []ghPR, reviewCount int) {
 	p.prevReviewCount = reviewCount
 }
 
-func (p *githubPlugin) emitEvent(event pluginEvent) {
-	event.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	params := eventParams{Event: event}
-	payload, err := json.Marshal(params)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	out := fmt.Sprintf(`{"jsonrpc":"2.0","method":"event","params":%s}`, string(payload))
-	fmt.Fprintf(os.Stdout, "%s\n", out)
-}
-
-func sendResult(id int, result interface{}) {
-	resp := rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
-}
-
-func sendError(id int, code int, message string, retryable bool, suggestedAction string) {
-	resp := rpcResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &rpcError{
-			Code:    code,
-			Message: message,
-			Data:    &pluginErrorData{Retryable: retryable, SuggestedAction: suggestedAction},
-		},
-	}
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
-}
-
-var initResult = initializedPayload{
-	Type:            "initialized",
-	ProtocolVersion: protocolVersion,
-	PluginVersion:   pluginVersion,
-	Health:          "ok",
-}
-
 func main() {
-	defer func() {
-		if r := recover(); r != nil {
-			logDebug("panic: %v", r)
-		}
-	}()
-
-	pl := &githubPlugin{
-		client:  &http.Client{Timeout: 12 * time.Second},
-		prevPRs: make(map[string]prevPRInfo),
+	sdk.Run(pluginID, pluginVersion, &githubPlugin{
+		client:    &http.Client{Timeout: 12 * time.Second},
+		prevPRs:   make(map[string]prevPRInfo),
 		prMetaMap: make(map[string]prMeta),
-	}
-
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(nil, 2*1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			continue
-		}
-
-		switch req.Method {
-		case "initialize":
-			var params initializeParams
-			if err := json.Unmarshal(req.Params, &params); err == nil {
-				plugindebug.ConfigureFromInitializeConfig(params.Config)
-			for _, auth := range params.ProviderAuths {
-				if auth.AccountID != "" {
-					pl.token = auth.AccountID
-					break
-				}
-				if auth.AccessToken != "" {
-					pl.token = auth.AccessToken
-					break
-				}
-			}
-			if pl.token == "" && params.Auth != nil && params.Auth.AccountID != "" {
-				pl.token = params.Auth.AccountID
-			}
-		}
-			sendResult(req.ID, initResult)
-
-		case "getStatus":
-			sendResult(req.ID, pl.buildSnapshot())
-
-		case "refresh":
-			sendResult(req.ID, pl.buildSnapshot())
-
-		case "shutdown":
-			sendResult(req.ID, nil)
-			return
-
-		case "performAction":
-			var actionParams struct {
-				ActionID string            `json:"actionId"`
-				Payload  map[string]string `json:"payload"`
-			}
-			if err := json.Unmarshal(req.Params, &actionParams); err != nil {
-				sendError(req.ID, -32602, "invalid params", false, "")
-				continue
-			}
-			switch actionParams.ActionID {
-			case "getMRDiff":
-				idStr := strings.TrimSpace(actionParams.Payload["id"])
-				success, data := pl.handleGetMRDiff(idStr)
-				sendResult(req.ID, performActionResult{Success: success, Data: data})
-			case "summarize":
-				idStr := strings.TrimSpace(actionParams.Payload["id"])
-				sendResult(req.ID, pl.handleSummarize(idStr))
-			default:
-				sendError(req.ID, -32601, fmt.Sprintf("unknown action: %s", actionParams.ActionID), false, "")
-			}
-
-		default:
-			sendError(req.ID, -32601, fmt.Sprintf("unknown method: %s", req.Method), false, "")
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		logDebug("stdin scanner error: %v", err)
-	}
+	})
 }

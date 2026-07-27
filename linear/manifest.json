@@ -1,7 +1,7 @@
 {
   "id": "linear",
   "name": "Linear",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Assigned issues and workflow signals from Linear",
   "icon": {
     "type": "sfSymbol",

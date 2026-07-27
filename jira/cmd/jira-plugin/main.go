@@ -1,30 +1,24 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lum1n/smuler/plugins/httphealth"
-	"github.com/lum1n/smuler/plugins/plugindebug"
+	sdk "github.com/lum1n/smuler/plugins/sdk-go"
 )
 
-func logDebug(format string, args ...interface{}) {
-	plugindebug.Log("[jira-plugin]", format, args...)
-}
-
 const (
-	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.1"
+	pluginID      = "jira"
+	pluginVersion   = "0.1.2"
 )
 
 type apiHTTPError struct {
@@ -37,119 +31,6 @@ func (e *apiHTTPError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
 }
 
-// --- JSON-RPC types ---
-
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int              `json:"code"`
-	Message string           `json:"message"`
-	Data    *pluginErrorData `json:"data,omitempty"`
-}
-
-type pluginErrorData struct {
-	Retryable       bool   `json:"retryable"`
-	SuggestedAction string `json:"suggestedAction,omitempty"`
-}
-
-type initializeParams struct {
-	ProtocolVersion string                `json:"protocolVersion"`
-	PluginID        string                `json:"pluginId"`
-	Config          map[string]string     `json:"config"`
-	ProviderAuths   []providerAuthContext `json:"providerAuths"`
-}
-
-type providerAuthContext struct {
-	ProviderID   string `json:"providerId"`
-	Kind         string `json:"kind"`
-	CookieHeader string `json:"cookieHeader,omitempty"`
-}
-
-type initializedPayload struct {
-	Type            string `json:"type"`
-	ProtocolVersion string `json:"protocolVersion"`
-	PluginVersion   string `json:"pluginVersion"`
-	Health          string `json:"health"`
-}
-
-type pluginSnapshot struct {
-	PluginID     string         `json:"pluginId"`
-	State        string         `json:"state"`
-	Summary      pluginSummary  `json:"summary"`
-	Items        []pluginItem   `json:"items"`
-	Actions      []pluginAction `json:"actions"`
-	Alerts       []pluginAlert  `json:"alerts"`
-	RefreshAfter int            `json:"refreshAfter"`
-	Health       string         `json:"health"`
-}
-
-type pluginSummary struct {
-	Title    string `json:"title"`
-	Value    string `json:"value"`
-	Trend    string `json:"trend"`
-	Severity string `json:"severity"`
-	IconHint string `json:"iconHint"`
-}
-
-type pluginItem struct {
-	ID        string         `json:"id"`
-	Title     string         `json:"title"`
-	Subtitle  string         `json:"subtitle,omitempty"`
-	Detail    string         `json:"detail,omitempty"`
-	Severity  string         `json:"severity"`
-	Timestamp string         `json:"timestamp,omitempty"`
-	DeepLink  string         `json:"deepLink,omitempty"`
-	Actions   []pluginAction `json:"actions"`
-}
-
-type pluginAction struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-}
-
-type pluginAlert struct {
-	ID       string `json:"id"`
-	Severity string `json:"severity"`
-	Message  string `json:"message"`
-}
-
-type pluginEvent struct {
-	Type      string            `json:"type"`
-	PluginID  string            `json:"pluginId"`
-	Message   string            `json:"message"`
-	Severity  string            `json:"severity"`
-	Data      map[string]string `json:"data"`
-	Timestamp string            `json:"timestamp"`
-}
-
-type eventParams struct {
-	Event pluginEvent `json:"event"`
-}
-
-type performActionParams struct {
-	PluginID string            `json:"pluginId"`
-	ActionID string            `json:"actionId"`
-	Payload  map[string]string `json:"payload"`
-}
-
-type performActionResult struct {
-	Success bool   `json:"success"`
-	Data    string `json:"data,omitempty"`
-	Error   string `json:"error,omitempty"`
-}
-
 // --- Jira API types ---
 
 type jiraSearchResponse struct {
@@ -158,9 +39,9 @@ type jiraSearchResponse struct {
 }
 
 type jiraIssue struct {
-	ID     string        `json:"id"`
-	Key    string        `json:"key"`
-	Fields jiraFields    `json:"fields"`
+	ID     string     `json:"id"`
+	Key    string     `json:"key"`
+	Fields jiraFields `json:"fields"`
 }
 
 type jiraFields struct {
@@ -225,18 +106,18 @@ type jiraUser struct {
 // --- Config ---
 
 type jiraConfig struct {
-	Domain        string
-	ShowAssigned  bool
-	ShowWatching  bool
-	ShowMentions  bool
-	ShowSprint    bool
-	JQL           string
-	MaxIssues     int
+	Domain       string
+	ShowAssigned bool
+	ShowWatching bool
+	ShowMentions bool
+	ShowSprint   bool
+	JQL          string
+	MaxIssues    int
 }
 
 // --- Plugin ---
 
-type jiraPlugin struct {
+type jiraHandler struct {
 	client        *http.Client
 	config        jiraConfig
 	domain        string
@@ -244,67 +125,7 @@ type jiraPlugin struct {
 	prevIssueKeys map[string]string
 }
 
-func main() {
-	logDebug("starting jira plugin")
-
-	pl := &jiraPlugin{
-		client:        &http.Client{Timeout: 15 * time.Second},
-		config:        jiraConfig{ShowAssigned: true, MaxIssues: 10},
-		prevIssueKeys: make(map[string]string),
-	}
-
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			logDebug("decode request failed: %v", err)
-			continue
-		}
-
-		switch req.Method {
-		case "initialize":
-			if err := pl.handleInitialize(req); err != nil {
-			logDebug("initialize failed: %v", err)
-				sendError(req.ID, -32000, err.Error(), false, "Check Jira domain and session cookie.")
-			}
-		case "getStatus", "refresh":
-			snap, err := pl.buildSnapshot()
-			if err != nil {
-				logDebug("buildSnapshot failed: %v", err)
-				sendError(req.ID, -32000, err.Error(), true, "Jira API may be unreachable.")
-				continue
-			}
-			sendResult(req.ID, snap)
-		case "performAction":
-			result, err := pl.handlePerformAction(req)
-			if err != nil {
-				logDebug("performAction failed: %v", err)
-				sendError(req.ID, -32000, err.Error(), false, "Action failed.")
-				continue
-			}
-			sendResult(req.ID, result)
-		case "shutdown":
-			logDebug("shutdown")
-			sendResult(req.ID, nil)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		logDebug("scanner error: %v", err)
-	}
-}
-
-func (p *jiraPlugin) handleInitialize(req rpcRequest) error {
-	var params initializeParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return fmt.Errorf("decode initialize: %w", err)
-	}
-
-	plugindebug.ConfigureFromInitializeConfig(params.Config)
+func (p *jiraHandler) Initialize(params sdk.InitializeParams) string {
 	p.config = parseConfig(params.Config)
 	p.domain = normalizeDomain(p.config.Domain)
 
@@ -315,44 +136,46 @@ func (p *jiraPlugin) handleInitialize(req rpcRequest) error {
 		}
 	}
 
-	logDebug("initialize domain=%q cookie=%t assigned=%t watching=%t mentions=%t sprint=%t jql=%q max=%d",
+	sdk.Log("initialize domain=%q cookie=%t assigned=%t watching=%t mentions=%t sprint=%t jql=%q max=%d",
 		p.domain, p.cookieHeader != "", p.config.ShowAssigned, p.config.ShowWatching,
 		p.config.ShowMentions, p.config.ShowSprint, p.config.JQL, p.config.MaxIssues)
 
-	sendResult(req.ID, initializedPayload{
-		Type:            "initialized",
-		ProtocolVersion: protocolVersion,
-		PluginVersion:   pluginVersion,
-		Health:          "ok",
-	})
-	return nil
+	if p.domain == "" || p.cookieHeader == "" {
+		return sdk.HealthAuthReq
+	}
+	return sdk.HealthOK
 }
 
-func (p *jiraPlugin) buildSnapshot() (*pluginSnapshot, error) {
+func (p *jiraHandler) GetStatus() sdk.Snapshot {
 	if p.domain == "" {
-		return &pluginSnapshot{
-			PluginID:     "jira",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "Jira", Value: "No domain", Severity: "info", IconHint: "jira"},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateDegraded,
+			Summary:      sdk.Summary{Title: "Jira", Value: "No domain", Severity: sdk.SeverityInfo, IconHint: "jira"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{},
 			RefreshAfter: 120,
-			Health:       "degraded",
-		}, nil
+			Health:       sdk.HealthDegraded,
+		}
 	}
 
 	if p.cookieHeader == "" {
-		return &pluginSnapshot{
-			PluginID:     "jira",
-			State:        "error",
-			Summary:      pluginSummary{Title: "Jira", Value: "No session", Severity: "warning", IconHint: "jira"},
-			Alerts:       []pluginAlert{{ID: "jira-no-auth", Severity: "warning", Message: "Import your browser session to connect to Jira."}},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateError,
+			Summary:      sdk.Summary{Title: "Jira", Value: "No session", Severity: sdk.SeverityWarning, IconHint: "jira"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "jira-no-auth", Severity: sdk.SeverityWarning, Message: "Import your browser session to connect to Jira."}},
 			RefreshAfter: 120,
-			Health:       "auth_required",
-		}, nil
+			Health:       sdk.HealthAuthReq,
+		}
 	}
 
 	issues, err := p.fetchIssues()
 	if err != nil {
-		logDebug("fetchIssues error: %v", err)
+		sdk.Log("fetchIssues error: %v", err)
 		if apiErr, ok := err.(*apiHTTPError); ok {
 			health := httphealth.ClassifyHTTPStatus(apiErr.StatusCode)
 			msg := "Could not reach Jira: " + apiErr.Error()
@@ -361,149 +184,155 @@ func (p *jiraPlugin) buildSnapshot() (*pluginSnapshot, error) {
 			} else if health == httphealth.HealthRateLimited {
 				msg = "Jira API rate limited"
 			}
-			return &pluginSnapshot{
-				PluginID:     "jira",
-				State:        "degraded",
-				Summary:      pluginSummary{Title: "Jira", Value: "Err", Trend: "steady", Severity: "warning", IconHint: "jira"},
-				Alerts:       []pluginAlert{{ID: "jira-fetch", Severity: "warning", Message: msg}},
+			return sdk.Snapshot{
+				PluginID:     pluginID,
+				State:        sdk.StateDegraded,
+				Summary:      sdk.Summary{Title: "Jira", Value: "Err", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "jira"},
+				Items:        []sdk.Item{},
+				Actions:      []sdk.Action{},
+				Alerts:       []sdk.Alert{{ID: "jira-fetch", Severity: sdk.SeverityWarning, Message: msg}},
 				RefreshAfter: httphealth.DefaultRefreshAfter(health, apiErr.RetryAfter),
 				Health:       health,
-			}, nil
+			}
 		}
-		return &pluginSnapshot{
-			PluginID:     "jira",
-			State:        "degraded",
-			Summary:      pluginSummary{Title: "Jira", Value: "Err", Trend: "steady", Severity: "warning", IconHint: "jira"},
-			Alerts:       []pluginAlert{{ID: "jira-fetch", Severity: "warning", Message: "Could not reach Jira: " + err.Error()}},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateDegraded,
+			Summary:      sdk.Summary{Title: "Jira", Value: "Err", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "jira"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "jira-fetch", Severity: sdk.SeverityWarning, Message: "Could not reach Jira: " + err.Error()}},
 			RefreshAfter: 120,
-			Health:       "degraded",
-		}, nil
+			Health:       sdk.HealthDegraded,
+		}
 	}
 
 	items := p.buildItems(issues)
 	alerts := p.buildAlerts(issues)
 	summary := p.buildSummary(items, len(issues))
 
+	p.emitDeltas(issues)
+
+	return sdk.Snapshot{
+		PluginID:     pluginID,
+		State:        sdk.StateReady,
+		Summary:      summary,
+		Items:        items,
+		Actions:      []sdk.Action{},
+		Alerts:       alerts,
+		RefreshAfter: 60,
+		Health:       sdk.HealthOK,
+	}
+}
+
+func (p *jiraHandler) emitDeltas(issues []jiraIssue) {
 	prevKeys := p.prevIssueKeys
 	currentKeys := make(map[string]string)
 	for _, issue := range issues {
 		currentKeys[issue.Key] = issue.Fields.Status.Name
 	}
 
+	now := time.Now().UTC().Format(time.RFC3339)
+
 	for key, oldStatus := range prevKeys {
 		newStatus, ok := currentKeys[key]
 		if !ok {
-			logDebug("issue resolved key=%s", key)
-			emitEvent(pluginEvent{
-				Type:     "issue.resolved",
-				PluginID: "jira",
-				Message:  fmt.Sprintf("%s was resolved or moved", key),
-				Severity: "info",
-				Data:     map[string]string{"issueKey": key, "url": fmt.Sprintf("%s/browse/%s", p.domain, key)},
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			sdk.Log("issue resolved key=%s", key)
+			sdk.Emit(sdk.Event{
+				Type:      "issue.resolved",
+				PluginID:  pluginID,
+				Message:   fmt.Sprintf("%s was resolved or moved", key),
+				Severity:  sdk.SeverityInfo,
+				Data:      map[string]string{"issueKey": key, "url": fmt.Sprintf("%s/browse/%s", p.domain, key)},
+				Timestamp: now,
 			})
 			continue
 		}
 		if newStatus != oldStatus {
-			logDebug("issue transition key=%s %s -> %s", key, oldStatus, newStatus)
-			emitEvent(pluginEvent{
-				Type:     "issue.updated",
-				PluginID: "jira",
-				Message:  fmt.Sprintf("%s moved to %s", key, newStatus),
-				Severity: "info",
-				Data:     map[string]string{"issueKey": key, "url": fmt.Sprintf("%s/browse/%s", p.domain, key)},
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			sdk.Log("issue transition key=%s %s -> %s", key, oldStatus, newStatus)
+			sdk.Emit(sdk.Event{
+				Type:      "issue.updated",
+				PluginID:  pluginID,
+				Message:   fmt.Sprintf("%s moved to %s", key, newStatus),
+				Severity:  sdk.SeverityInfo,
+				Data:      map[string]string{"issueKey": key, "url": fmt.Sprintf("%s/browse/%s", p.domain, key)},
+				Timestamp: now,
 			})
 		}
 	}
 
 	for key := range currentKeys {
 		if _, ok := prevKeys[key]; !ok && len(prevKeys) > 0 {
-			logDebug("new issue key=%s", key)
-			emitEvent(pluginEvent{
-				Type:     "issue.created",
-				PluginID: "jira",
-				Message:  fmt.Sprintf("New issue: %s", key),
-				Severity: "info",
-				Data:     map[string]string{"issueKey": key, "url": fmt.Sprintf("%s/browse/%s", p.domain, key)},
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			sdk.Log("new issue key=%s", key)
+			sdk.Emit(sdk.Event{
+				Type:      "issue.created",
+				PluginID:  pluginID,
+				Message:   fmt.Sprintf("New issue: %s", key),
+				Severity:  sdk.SeverityInfo,
+				Data:      map[string]string{"issueKey": key, "url": fmt.Sprintf("%s/browse/%s", p.domain, key)},
+				Timestamp: now,
 			})
 		}
 	}
 
 	p.prevIssueKeys = currentKeys
-
-	snap := &pluginSnapshot{
-		PluginID:     "jira",
-		State:        "ready",
-		Summary:      summary,
-		Items:        items,
-		Actions:      []pluginAction{},
-		Alerts:       alerts,
-		RefreshAfter: 60,
-		Health:       "ok",
-	}
-	return snap, nil
 }
 
-func (p *jiraPlugin) handlePerformAction(req rpcRequest) (*performActionResult, error) {
+func (p *jiraHandler) PerformAction(id string, params map[string]string) (bool, string) {
 	if p.domain == "" {
-		return nil, fmt.Errorf("no Jira domain configured")
+		return false, "no Jira domain configured"
 	}
 	if p.cookieHeader == "" {
-		return nil, fmt.Errorf("no Jira session configured")
+		return false, "no Jira session configured"
 	}
 
-	var params performActionParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return nil, fmt.Errorf("decode performAction params: %w", err)
-	}
-
-	switch params.ActionID {
+	switch id {
 	case "getIssueDetails":
-		key := strings.TrimSpace(params.Payload["key"])
+		key := strings.TrimSpace(params["key"])
 		if key == "" {
-			return nil, fmt.Errorf("missing key payload")
+			return false, "missing key payload"
 		}
 		return p.getIssueDetails(key)
 	case "searchIssues":
-		jql := strings.TrimSpace(params.Payload["jql"])
+		jql := strings.TrimSpace(params["jql"])
 		if jql == "" {
-			return nil, fmt.Errorf("missing jql payload")
+			return false, "missing jql payload"
 		}
 		return p.searchIssues(jql)
 	default:
-		return nil, fmt.Errorf("unknown action %q", params.ActionID)
+		return false, fmt.Sprintf("unknown action %q", id)
 	}
 }
 
-func (p *jiraPlugin) getIssueDetails(key string) (*performActionResult, error) {
+func (p *jiraHandler) Shutdown() {}
+
+func (p *jiraHandler) getIssueDetails(key string) (bool, string) {
 	apiURL := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=summary,status,issuetype,priority,assignee,reporter,duedate,created,updated,labels,description,comment", p.domain, key)
 
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return nil, err
+		return false, err.Error()
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Cookie", p.cookieHeader)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, err
+		return false, err.Error()
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return false, err.Error()
 	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var issue jiraIssue
 	if err := json.Unmarshal(body, &issue); err != nil {
-		return nil, err
+		return false, err.Error()
 	}
 
 	description := strings.TrimSpace(extractADFText(issue.Fields.Description))
@@ -517,9 +346,9 @@ func (p *jiraPlugin) getIssueDetails(key string) (*performActionResult, error) {
 		Fields struct {
 			Comment struct {
 				Comments []struct {
-					Author  jiraUser `json:"author"`
+					Author  jiraUser        `json:"author"`
 					Body    json.RawMessage `json:"body"`
-					Created string `json:"created"`
+					Created string          `json:"created"`
 				} `json:"comments"`
 			} `json:"comment"`
 		} `json:"fields"`
@@ -550,17 +379,17 @@ func (p *jiraPlugin) getIssueDetails(key string) (*performActionResult, error) {
 	}
 	lines = append(lines, fmt.Sprintf("Link: %s/browse/%s", p.domain, issue.Key))
 
-	return &performActionResult{Success: true, Data: strings.Join(lines, "\n")}, nil
+	return true, strings.Join(lines, "\n")
 }
 
-func (p *jiraPlugin) searchIssues(jql string) (*performActionResult, error) {
+func (p *jiraHandler) searchIssues(jql string) (bool, string) {
 	issues, err := p.fetchIssuesWithJQL(jql)
 	if err != nil {
-		return nil, err
+		return false, err.Error()
 	}
 
 	if len(issues) == 0 {
-		return &performActionResult{Success: true, Data: "No issues found."}, nil
+		return true, "No issues found."
 	}
 
 	var lines []string
@@ -574,10 +403,10 @@ func (p *jiraPlugin) searchIssues(jql string) (*performActionResult, error) {
 		lines = append(lines, "  - "+line)
 	}
 
-	return &performActionResult{Success: true, Data: strings.Join(lines, "\n")}, nil
+	return true, strings.Join(lines, "\n")
 }
 
-func (p *jiraPlugin) fetchIssuesWithJQL(jql string) ([]jiraIssue, error) {
+func (p *jiraHandler) fetchIssuesWithJQL(jql string) ([]jiraIssue, error) {
 	apiURL := fmt.Sprintf("%s/rest/api/3/search/jql", p.domain)
 
 	reqBody := struct {
@@ -631,11 +460,11 @@ func humanDate(iso string) string {
 	return t.Format("Jan 2")
 }
 
-func (p *jiraPlugin) fetchIssues() ([]jiraIssue, error) {
+func (p *jiraHandler) fetchIssues() ([]jiraIssue, error) {
 	jql := p.buildJQL()
 	apiURL := fmt.Sprintf("%s/rest/api/3/search/jql", p.domain)
 
-	logDebug("fetching url=%s jql=%s max=%d", apiURL, jql, p.config.MaxIssues)
+	sdk.Log("fetching url=%s jql=%s max=%d", apiURL, jql, p.config.MaxIssues)
 
 	reqBody := struct {
 		JQL        string   `json:"jql"`
@@ -683,11 +512,11 @@ func (p *jiraPlugin) fetchIssues() ([]jiraIssue, error) {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
-	logDebug("got total=%d issues=%d", result.Total, len(result.Issues))
+	sdk.Log("got total=%d issues=%d", result.Total, len(result.Issues))
 	return result.Issues, nil
 }
 
-func (p *jiraPlugin) buildJQL() string {
+func (p *jiraHandler) buildJQL() string {
 	if strings.TrimSpace(p.config.JQL) != "" {
 		jql := strings.TrimSpace(p.config.JQL)
 		return fmt.Sprintf("%s ORDER BY updated DESC", jql)
@@ -720,8 +549,8 @@ func (p *jiraPlugin) buildJQL() string {
 	return fmt.Sprintf("(%s) AND statusCategory != Done ORDER BY updated DESC", clause)
 }
 
-func (p *jiraPlugin) buildItems(issues []jiraIssue) []pluginItem {
-	items := make([]pluginItem, 0, len(issues))
+func (p *jiraHandler) buildItems(issues []jiraIssue) []sdk.Item {
+	items := make([]sdk.Item, 0, len(issues))
 	for _, issue := range issues {
 		detail := fmt.Sprintf("%s | %s", issue.Fields.IssueType.Name, issue.Fields.Status.Name)
 		if issue.Fields.Priority.Name != "" {
@@ -738,22 +567,22 @@ func (p *jiraPlugin) buildItems(issues []jiraIssue) []pluginItem {
 			subtitle = issue.Fields.Assignee.DisplayName
 		}
 
-		severity := "info"
+		severity := sdk.SeverityInfo
 		if issue.Fields.Priority.Name == "Highest" || issue.Fields.Priority.Name == "High" {
-			severity = "warning"
+			severity = sdk.SeverityWarning
 		}
 
 		if issue.Fields.DueDate != nil {
 			due, err := time.Parse("2006-01-02", *issue.Fields.DueDate)
 			if err == nil && due.Before(time.Now()) {
-				severity = "critical"
+				severity = sdk.SeverityCritical
 				detail = fmt.Sprintf("OVERDUE | %s", detail)
 			}
 		}
 
 		deepLink := fmt.Sprintf("%s/browse/%s", p.domain, issue.Key)
 
-		items = append(items, pluginItem{
+		items = append(items, sdk.Item{
 			ID:        issue.Key,
 			Title:     fmt.Sprintf("%s %s", issue.Key, issue.Fields.Summary),
 			Subtitle:  subtitle,
@@ -761,7 +590,7 @@ func (p *jiraPlugin) buildItems(issues []jiraIssue) []pluginItem {
 			Severity:  severity,
 			Timestamp: issue.Fields.Updated,
 			DeepLink:  deepLink,
-			Actions:   []pluginAction{},
+			Actions:   []sdk.Action{},
 		})
 	}
 
@@ -782,8 +611,8 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-func (p *jiraPlugin) buildAlerts(issues []jiraIssue) []pluginAlert {
-	alerts := []pluginAlert{}
+func (p *jiraHandler) buildAlerts(issues []jiraIssue) []sdk.Alert {
+	alerts := []sdk.Alert{}
 
 	overdueCount := 0
 	for _, issue := range issues {
@@ -796,9 +625,9 @@ func (p *jiraPlugin) buildAlerts(issues []jiraIssue) []pluginAlert {
 	}
 
 	if overdueCount > 0 {
-		alerts = append(alerts, pluginAlert{
+		alerts = append(alerts, sdk.Alert{
 			ID:       "jira-overdue",
-			Severity: "critical",
+			Severity: sdk.SeverityCritical,
 			Message:  fmt.Sprintf("%d overdue issue(s)", overdueCount),
 		})
 	}
@@ -806,26 +635,26 @@ func (p *jiraPlugin) buildAlerts(issues []jiraIssue) []pluginAlert {
 	return alerts
 }
 
-func (p *jiraPlugin) buildSummary(items []pluginItem, total int) pluginSummary {
+func (p *jiraHandler) buildSummary(items []sdk.Item, total int) sdk.Summary {
 	if total == 0 {
-		return pluginSummary{
+		return sdk.Summary{
 			Title:    "Jira",
 			Value:    "0 issues",
-			Trend:    "steady",
-			Severity: "info",
+			Trend:    sdk.TrendSteady,
+			Severity: sdk.SeverityInfo,
 			IconHint: "jira",
 		}
 	}
 
 	value := fmt.Sprintf("%d", len(items))
-	severity := "info"
+	severity := sdk.SeverityInfo
 	for _, item := range items {
-		if item.Severity == "critical" {
-			severity = "critical"
+		if item.Severity == sdk.SeverityCritical {
+			severity = sdk.SeverityCritical
 			break
 		}
-		if item.Severity == "warning" && severity != "critical" {
-			severity = "warning"
+		if item.Severity == sdk.SeverityWarning && severity != sdk.SeverityCritical {
+			severity = sdk.SeverityWarning
 		}
 	}
 
@@ -833,10 +662,10 @@ func (p *jiraPlugin) buildSummary(items []pluginItem, total int) pluginSummary {
 		value = fmt.Sprintf("%d+", p.config.MaxIssues)
 	}
 
-	return pluginSummary{
+	return sdk.Summary{
 		Title:    "Jira",
 		Value:    fmt.Sprintf("%s issues", value),
-		Trend:    "steady",
+		Trend:    sdk.TrendSteady,
 		Severity: severity,
 		IconHint: "jira",
 	}
@@ -902,42 +731,10 @@ func parseBool(raw string, defaultValue bool) bool {
 	}
 }
 
-func sendResult(id int, result interface{}) {
-	resp := rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
-}
-
-func sendError(id int, code int, message string, retryable bool, suggestedAction string) {
-	resp := rpcResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &rpcError{
-			Code:    code,
-			Message: message,
-			Data:    &pluginErrorData{Retryable: retryable, SuggestedAction: suggestedAction},
-		},
-	}
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
-}
-
-func emitEvent(event pluginEvent) {
-	event.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	params := eventParams{Event: event}
-	payload, err := json.Marshal(params)
-	if err != nil {
-		logDebug("json marshal error: %v", err)
-		return
-	}
-	out := fmt.Sprintf(`{"jsonrpc":"2.0","method":"event","params":%s}`, string(payload))
-	fmt.Fprintf(os.Stdout, "%s\n", out)
+func main() {
+	sdk.Run(pluginID, pluginVersion, &jiraHandler{
+		client:        &http.Client{Timeout: 15 * time.Second},
+		config:        jiraConfig{ShowAssigned: true, MaxIssues: 10},
+		prevIssueKeys: make(map[string]string),
+	})
 }

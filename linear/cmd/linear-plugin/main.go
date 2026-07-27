@@ -1,128 +1,25 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lum1n/smuler/plugins/httphealth"
-	"github.com/lum1n/smuler/plugins/plugindebug"
+	sdk "github.com/lum1n/smuler/plugins/sdk-go"
 )
-
-func logDebug(format string, args ...interface{}) {
-	plugindebug.Log("[linear-plugin]", format, args...)
-}
 
 const (
-	apiURL          = "https://api.linear.app/graphql"
-	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.0"
+	apiURL        = "https://api.linear.app/graphql"
+	pluginID      = "linear"
+	pluginVersion   = "0.1.1"
 )
-
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int              `json:"code"`
-	Message string           `json:"message"`
-	Data    *pluginErrorData `json:"data,omitempty"`
-}
-
-type pluginErrorData struct {
-	Retryable       bool   `json:"retryable"`
-	SuggestedAction string `json:"suggestedAction,omitempty"`
-}
-
-type initializeParams struct {
-	ProtocolVersion string            `json:"protocolVersion"`
-	PluginID        string            `json:"pluginId"`
-	Config          map[string]string `json:"config"`
-	Auth            *authContext      `json:"auth"`
-}
-
-type authContext struct {
-	AccountID string `json:"accountId"`
-}
-
-type initializedPayload struct {
-	Type            string `json:"type"`
-	ProtocolVersion string `json:"protocolVersion"`
-	PluginVersion   string `json:"pluginVersion"`
-	Health          string `json:"health"`
-}
-
-type pluginSnapshot struct {
-	PluginID     string         `json:"pluginId"`
-	State        string         `json:"state"`
-	Summary      pluginSummary  `json:"summary"`
-	Items        []pluginItem   `json:"items"`
-	Actions      []pluginAction `json:"actions"`
-	Alerts       []pluginAlert  `json:"alerts"`
-	RefreshAfter int            `json:"refreshAfter"`
-	Health       string         `json:"health"`
-}
-
-type pluginSummary struct {
-	Title    string `json:"title"`
-	Value    string `json:"value"`
-	Trend    string `json:"trend"`
-	Severity string `json:"severity"`
-	IconHint string `json:"iconHint"`
-}
-
-type pluginItem struct {
-	ID        string         `json:"id"`
-	Title     string         `json:"title"`
-	Subtitle  string         `json:"subtitle,omitempty"`
-	Detail    string         `json:"detail,omitempty"`
-	Severity  string         `json:"severity"`
-	Timestamp string         `json:"timestamp,omitempty"`
-	DeepLink  string         `json:"deepLink,omitempty"`
-	Actions   []pluginAction `json:"actions"`
-}
-
-type pluginAction struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-}
-
-type pluginAlert struct {
-	ID       string `json:"id"`
-	Severity string `json:"severity"`
-	Message  string `json:"message"`
-}
-
-type pluginEvent struct {
-	Type      string            `json:"type"`
-	PluginID  string            `json:"pluginId"`
-	Message   string            `json:"message"`
-	Severity  string            `json:"severity"`
-	Data      map[string]string `json:"data"`
-	Timestamp string            `json:"timestamp"`
-}
-
-type eventParams struct {
-	Event pluginEvent `json:"event"`
-}
 
 type linearConfig struct {
 	ShowAssigned bool
@@ -131,7 +28,7 @@ type linearConfig struct {
 	TeamIDs      []string
 }
 
-type linearPlugin struct {
+type linearHandler struct {
 	token          string
 	config         linearConfig
 	client         *http.Client
@@ -223,71 +120,13 @@ type signal struct {
 	uniqueID  string
 }
 
-func main() {
-	defer func() {
-		if r := recover(); r != nil {
-			logDebug("panic: %v", r)
-		}
-	}()
-
-	pl := &linearPlugin{
-		client:        &http.Client{Timeout: 12 * time.Second},
-		config:        linearConfig{ShowAssigned: true},
-		prevIssueIDs:  make(map[string]prevIssueInfo),
-	}
-	logDebug("started pwd=%s", mustGetwd())
-
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			logDebug("decode request failed: %v", err)
-			continue
-		}
-		logDebug("parsed method=%s id=%d", req.Method, req.ID)
-
-		switch req.Method {
-		case "initialize":
-			if err := pl.handleInitialize(req); err != nil {
-				logDebug("initialize failed: %v", err)
-				sendError(req.ID, -32000, err.Error(), false, "Check Linear token and settings")
-			}
-		case "getStatus", "refresh":
-			logDebug("building snapshot")
-			sendResult(req.ID, pl.buildSnapshot())
-		case "shutdown":
-			logDebug("shutdown")
-			sendResult(req.ID, nil)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		logDebug("scanner error: %v", err)
-	}
-}
-
-func (p *linearPlugin) handleInitialize(req rpcRequest) error {
-	var params initializeParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return fmt.Errorf("decode initialize: %w", err)
-	}
-	plugindebug.ConfigureFromInitializeConfig(params.Config)
+func (p *linearHandler) Initialize(params sdk.InitializeParams) string {
 	if params.Auth != nil {
 		p.token = strings.TrimSpace(params.Auth.AccountID)
 	}
 	p.config = parseConfig(params.Config)
-	logDebug("initialize token=%t assigned=%t mentions=%t triage=%t teamIds=%q", p.token != "", p.config.ShowAssigned, p.config.ShowMentions, p.config.ShowTriage, strings.Join(p.config.TeamIDs, ","))
-	sendResult(req.ID, initializedPayload{
-		Type:            "initialized",
-		ProtocolVersion: protocolVersion,
-		PluginVersion:   pluginVersion,
-		Health:          "ok",
-	})
-	return nil
+	sdk.Log("initialize token=%t assigned=%t mentions=%t triage=%t teamIds=%q", p.token != "", p.config.ShowAssigned, p.config.ShowMentions, p.config.ShowTriage, strings.Join(p.config.TeamIDs, ","))
+	return sdk.HealthOK
 }
 
 func parseConfig(cfg map[string]string) linearConfig {
@@ -330,9 +169,19 @@ func splitCSV(raw string) []string {
 	return result
 }
 
-func (p *linearPlugin) buildSnapshot() pluginSnapshot {
+func (p *linearHandler) GetStatus() sdk.Snapshot {
+	return p.buildSnapshot()
+}
+
+func (p *linearHandler) PerformAction(id string, params map[string]string) (bool, string) {
+	return false, "unknown action: " + id
+}
+
+func (p *linearHandler) Shutdown() {}
+
+func (p *linearHandler) buildSnapshot() sdk.Snapshot {
 	if strings.TrimSpace(p.token) == "" {
-		return emptySnapshot("No token configured", "auth_required", 0)
+		return emptySnapshot("No token configured", sdk.HealthAuthReq, 0)
 	}
 
 	p.lastError = ""
@@ -345,12 +194,12 @@ func (p *linearPlugin) buildSnapshot() pluginSnapshot {
 			message = "Linear API unreachable"
 		}
 		if rateLimited {
-			return emptySnapshot(message, "rate_limited", p.lastRetryAfter)
+			return emptySnapshot(message, sdk.HealthRateLimited, p.lastRetryAfter)
 		}
 		if p.lastHTTPStatus == http.StatusUnauthorized || p.lastHTTPStatus == http.StatusForbidden {
-			return emptySnapshot("Linear authentication failed — reconnect in Settings", "auth_required", p.lastRetryAfter)
+			return emptySnapshot("Linear authentication failed — reconnect in Settings", sdk.HealthAuthReq, p.lastRetryAfter)
 		}
-		return emptySnapshot(message, "degraded", p.lastRetryAfter)
+		return emptySnapshot(message, sdk.HealthDegraded, p.lastRetryAfter)
 	}
 
 	signals := collectSignals(data, p.config)
@@ -359,20 +208,20 @@ func (p *linearPlugin) buildSnapshot() pluginSnapshot {
 	p.emitDeltaEvents(signals)
 
 	if len(signals) == 0 {
-		return pluginSnapshot{
-			PluginID: "linear",
-			State:    "ready",
-			Summary: pluginSummary{Title: "Linear", Value: "No active issues", Trend: "steady", Severity: "info", IconHint: "circle.grid.2x2"},
-			Items:        []pluginItem{},
-			Actions:      []pluginAction{{ID: "refresh", Label: "Refresh"}},
-			Alerts:       []pluginAlert{},
+		return sdk.Snapshot{
+			PluginID:     pluginID,
+			State:        sdk.StateReady,
+			Summary:      sdk.Summary{Title: "Linear", Value: "No active issues", Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "circle.grid.2x2"},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{{ID: "refresh", Label: "Refresh"}},
+			Alerts:       []sdk.Alert{},
 			RefreshAfter: 300,
-			Health:       "ok",
+			Health:       sdk.HealthOK,
 		}
 	}
 
-	items := make([]pluginItem, 0, len(signals))
-	alerts := make([]pluginAlert, 0)
+	items := make([]sdk.Item, 0, len(signals))
+	alerts := make([]sdk.Alert, 0)
 	alertIDs := map[string]struct{}{}
 	overdueCount := 0
 	mentionCount := 0
@@ -383,7 +232,7 @@ func (p *linearPlugin) buildSnapshot() pluginSnapshot {
 		if signal.alert != "" {
 			if _, ok := alertIDs[signal.alert]; !ok {
 				alertIDs[signal.alert] = struct{}{}
-				alerts = append(alerts, pluginAlert{ID: signal.uniqueID + "-alert", Severity: signal.severity, Message: signal.alert})
+				alerts = append(alerts, sdk.Alert{ID: signal.uniqueID + "-alert", Severity: signal.severity, Message: signal.alert})
 			}
 		}
 		if strings.Contains(strings.ToLower(signal.detail), "overdue") {
@@ -397,30 +246,30 @@ func (p *linearPlugin) buildSnapshot() pluginSnapshot {
 		}
 	}
 
-	severity := "info"
+	severity := sdk.SeverityInfo
 	value := fmt.Sprintf("%d assigned", countKind(signals, "assigned"))
-	trend := "steady"
+	trend := sdk.TrendSteady
 	if overdueCount > 0 {
-		severity = "warning"
+		severity = sdk.SeverityWarning
 		value = fmt.Sprintf("%d overdue", overdueCount)
 	}
 	if overdueCount == 0 && mentionCount > 0 {
 		value = fmt.Sprintf("%d mentions", mentionCount)
-		trend = "up"
+		trend = sdk.TrendUp
 	}
 	if overdueCount == 0 && mentionCount == 0 && triageCount > 0 {
 		value = fmt.Sprintf("%d triage", triageCount)
 	}
 
-	return pluginSnapshot{
-		PluginID: "linear",
-		State:    "ready",
-		Summary:  pluginSummary{Title: "Linear", Value: value, Trend: trend, Severity: severity, IconHint: "circle.grid.2x2"},
-		Items:    items,
-		Actions:  []pluginAction{{ID: "refresh", Label: "Refresh"}},
-		Alerts:   alerts,
+	return sdk.Snapshot{
+		PluginID:     pluginID,
+		State:        sdk.StateReady,
+		Summary:      sdk.Summary{Title: "Linear", Value: value, Trend: trend, Severity: severity, IconHint: "circle.grid.2x2"},
+		Items:        items,
+		Actions:      []sdk.Action{{ID: "refresh", Label: "Refresh"}},
+		Alerts:       alerts,
 		RefreshAfter: 300,
-		Health:       "ok",
+		Health:       sdk.HealthOK,
 	}
 }
 
@@ -434,21 +283,20 @@ func countKind(signals []signal, kind string) int {
 	return count
 }
 
-func emptySnapshot(message, health string, retryAfter int) pluginSnapshot {
-	return pluginSnapshot{
-		PluginID:     "linear",
-		State:        "degraded",
-		Summary:      pluginSummary{Title: "Linear", Value: message, Trend: "steady", Severity: "info", IconHint: "circle.grid.2x2"},
-		Items:        []pluginItem{},
-		Actions:      []pluginAction{},
-		Alerts:       []pluginAlert{{ID: "linear-config", Severity: "info", Message: message}},
+func emptySnapshot(message, health string, retryAfter int) sdk.Snapshot {
+	return sdk.Snapshot{
+		PluginID:     pluginID,
+		State:        sdk.StateDegraded,
+		Summary:      sdk.Summary{Title: "Linear", Value: message, Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "circle.grid.2x2"},
+		Items:        []sdk.Item{},
+		Actions:      []sdk.Action{},
+		Alerts:       []sdk.Alert{{ID: "linear-config", Severity: sdk.SeverityInfo, Message: message}},
 		RefreshAfter: httphealth.DefaultRefreshAfter(health, retryAfter),
 		Health:       health,
 	}
 }
 
-func (p *linearPlugin) emitDeltaEvents(signals []signal) {
-	now := time.Now().UTC().Format(time.RFC3339)
+func (p *linearHandler) emitDeltaEvents(signals []signal) {
 	currentIDs := make(map[string]prevIssueInfo) // id -> info
 	currentOverdue := 0
 
@@ -476,15 +324,12 @@ func (p *linearPlugin) emitDeltaEvents(signals []signal) {
 				case "triage":
 					label = fmt.Sprintf("New triage issue: %s", displayID)
 				}
-				sendNotification("event", eventParams{
-					Event: pluginEvent{
-						Type:      "issue.created",
-						PluginID:  "linear",
-						Message:   label,
-						Severity:  "info",
-						Data:      map[string]string{"issueId": id, "kind": info.kind, "url": info.url},
-						Timestamp: now,
-					},
+				sdk.Emit(sdk.Event{
+					Type:     "issue.created",
+					PluginID: pluginID,
+					Message:  label,
+					Severity: sdk.SeverityInfo,
+					Data:     map[string]string{"issueId": id, "kind": info.kind, "url": info.url},
 				})
 			}
 		}
@@ -496,30 +341,24 @@ func (p *linearPlugin) emitDeltaEvents(signals []signal) {
 				if displayID == "" {
 					displayID = id
 				}
-				sendNotification("event", eventParams{
-					Event: pluginEvent{
-						Type:      "issue.resolved",
-						PluginID:  "linear",
-						Message:   fmt.Sprintf("Issue %s completed or moved", displayID),
-						Severity:  "info",
-						Data:      map[string]string{"issueId": id, "kind": prevInfo.kind, "url": prevInfo.url},
-						Timestamp: now,
-					},
+				sdk.Emit(sdk.Event{
+					Type:     "issue.resolved",
+					PluginID: pluginID,
+					Message:  fmt.Sprintf("Issue %s completed or moved", displayID),
+					Severity: sdk.SeverityInfo,
+					Data:     map[string]string{"issueId": id, "kind": prevInfo.kind, "url": prevInfo.url},
 				})
 			}
 		}
 
 		// Detect new overdue issues
 		if currentOverdue > p.prevOverdueCount {
-			sendNotification("event", eventParams{
-				Event: pluginEvent{
-					Type:      "issue.overdue",
-					PluginID:  "linear",
-					Message:   fmt.Sprintf("%d overdue issue(s) need attention", currentOverdue),
-					Severity:  "warning",
-					Data:      map[string]string{"count": strconv.Itoa(currentOverdue)},
-					Timestamp: now,
-				},
+			sdk.Emit(sdk.Event{
+				Type:     "issue.overdue",
+				PluginID: pluginID,
+				Message:  fmt.Sprintf("%d overdue issue(s) need attention", currentOverdue),
+				Severity: sdk.SeverityWarning,
+				Data:     map[string]string{"count": strconv.Itoa(currentOverdue)},
 			})
 		}
 	}
@@ -528,13 +367,13 @@ func (p *linearPlugin) emitDeltaEvents(signals []signal) {
 	p.prevOverdueCount = currentOverdue
 }
 
-func (p *linearPlugin) fetchData() (graphqlData, bool, error) {
+func (p *linearHandler) fetchData() (graphqlData, bool, error) {
 	query, variables := p.buildQuery()
 	body, err := json.Marshal(graphqlRequest{Query: query, Variables: variables})
 	if err != nil {
 		return graphqlData{}, false, err
 	}
- 	logDebug("graphql query=%s", query)
+	sdk.Log("graphql query=%s", query)
 
 	req, err := http.NewRequest(http.MethodPost, apiURL, bytes.NewReader(body))
 	if err != nil {
@@ -542,7 +381,7 @@ func (p *linearPlugin) fetchData() (graphqlData, bool, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", p.token)
-	req.Header.Set("User-Agent", "smuler-linear-plugin/0.1.0")
+	req.Header.Set("User-Agent", "smuler-linear-plugin/"+pluginVersion)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -585,12 +424,12 @@ func (p *linearPlugin) fetchData() (graphqlData, bool, error) {
 				rateLimited = true
 			}
 		}
-		return graphqlData{}, rateLimited, fmt.Errorf(parsed.Errors[0].Message)
+		return graphqlData{}, rateLimited, fmt.Errorf("%s", parsed.Errors[0].Message)
 	}
 	return parsed.Data, false, nil
 }
 
-func (p *linearPlugin) buildQuery() (string, map[string]interface{}) {
+func (p *linearHandler) buildQuery() (string, map[string]interface{}) {
 	sections := []string{}
 	variables := map[string]interface{}{}
 
@@ -747,8 +586,8 @@ func priorityLabel(priority int) string {
 	return fmt.Sprintf("Priority %d", priority)
 }
 
-func toItem(s signal) pluginItem {
-	return pluginItem{
+func toItem(s signal) sdk.Item {
+	return sdk.Item{
 		ID:        s.uniqueID,
 		Title:     issueTitle(s.issue),
 		Subtitle:  itemSubtitle(s),
@@ -756,7 +595,7 @@ func toItem(s signal) pluginItem {
 		Severity:  s.severity,
 		Timestamp: s.issue.UpdatedAt,
 		DeepLink:  s.issue.URL,
-		Actions:   []pluginAction{{ID: "open", Label: "Open Issue"}},
+		Actions:   []sdk.Action{{ID: "open", Label: "Open Issue"}},
 	}
 }
 
@@ -795,56 +634,10 @@ func parseTime(raw string) time.Time {
 	return parsed
 }
 
-func sendResult(id int, result interface{}) {
-	logDebug("sending result id=%d", id)
-	resp := rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
-	if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
-		logDebug("json encode error: %v", err)
-	}
-}
-
-func sendError(id int, code int, message string, retryable bool, suggestedAction string) {
-	logDebug("sending error id=%d code=%d message=%s", id, code, message)
-	resp := rpcResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &rpcError{
-			Code:    code,
-			Message: message,
-			Data:    &pluginErrorData{Retryable: retryable, SuggestedAction: suggestedAction},
-		},
-	}
-	if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
-		logDebug("json encode error: %v", err)
-	}
-}
-
-func sendNotification(method string, params interface{}) {
-	notif := struct {
-		JSONRPC string      `json:"jsonrpc"`
-		Method  string      `json:"method"`
-		Params  interface{} `json:"params"`
-	}{
-		JSONRPC: "2.0",
-		Method:  method,
-		Params:  params,
-	}
-	if err := json.NewEncoder(os.Stdout).Encode(notif); err != nil {
-		logDebug("json encode error: %v", err)
-	}
-}
-
-func mustGetwd() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "unknown"
-	}
-	return wd
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+func main() {
+	sdk.Run(pluginID, pluginVersion, &linearHandler{
+		client:       &http.Client{Timeout: 12 * time.Second},
+		config:       linearConfig{ShowAssigned: true},
+		prevIssueIDs: make(map[string]prevIssueInfo),
+	})
 }
