@@ -24,7 +24,7 @@ func logDebug(format string, args ...interface{}) {
 
 const (
 	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.1"
+	pluginVersion   = "0.1.2"
 	cloudAPIBase    = "https://api.bitbucket.org/2.0"
 	cloudWebBase    = "https://bitbucket.org"
 )
@@ -150,9 +150,38 @@ type performActionParams struct {
 }
 
 type performActionResult struct {
-	Success bool   `json:"success"`
-	Data    string `json:"data,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Success bool            `json:"success"`
+	Data    string          `json:"data,omitempty"`
+	Error   string          `json:"error,omitempty"`
+	Window  *pluginWindow   `json:"window,omitempty"`
+	AI      *pluginAIAssist `json:"ai,omitempty"`
+}
+
+type pluginWindow struct {
+	ID       string                `json:"id"`
+	Title    string                `json:"title"`
+	Subtitle string                `json:"subtitle,omitempty"`
+	IconHint string                `json:"iconHint,omitempty"`
+	Sections []pluginWindowSection `json:"sections"`
+}
+
+type pluginWindowSection struct {
+	ID     string              `json:"id"`
+	Title  string              `json:"title,omitempty"`
+	Blocks []pluginWindowBlock `json:"blocks"`
+}
+
+type pluginWindowBlock struct {
+	ID    string `json:"id"`
+	Text  string `json:"text"`
+	Style string `json:"style,omitempty"`
+}
+
+type pluginAIAssist struct {
+	Task         string `json:"task"`
+	Input        string `json:"input"`
+	WindowID     string `json:"windowId"`
+	SectionTitle string `json:"sectionTitle,omitempty"`
 }
 
 // --- Common API types (normalized; both Cloud and Server map into these) ---
@@ -602,6 +631,16 @@ func (p *bitbucketPlugin) handlePerformAction(req rpcRequest) (*performActionRes
 			return nil, fmt.Errorf("invalid id payload")
 		}
 		return p.getMRDiff(id)
+	case "summarize":
+		idStr := strings.TrimSpace(params.Payload["id"])
+		if idStr == "" {
+			return nil, fmt.Errorf("missing id payload")
+		}
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid id payload")
+		}
+		return p.summarizePR(id)
 	case "searchPRs":
 		query := strings.TrimSpace(params.Payload["query"])
 		if query == "" {
@@ -727,6 +766,54 @@ func (p *bitbucketPlugin) getMRDiff(id int) (*performActionResult, error) {
 		return nil, fmt.Errorf("failed to fetch diff: %w", err)
 	}
 	return &performActionResult{Success: true, Data: diff}, nil
+}
+
+func (p *bitbucketPlugin) summarizePR(id int) (*performActionResult, error) {
+	pr, ok := p.prCache[id]
+	if !ok {
+		return nil, fmt.Errorf("PR %d not found in cache", id)
+	}
+
+	diffResult, err := p.getMRDiff(id)
+	if err != nil {
+		return nil, err
+	}
+	if diffResult == nil || strings.TrimSpace(diffResult.Data) == "" {
+		return &performActionResult{Success: false, Error: "Empty diff"}, nil
+	}
+
+	title := pr.Title
+	if title == "" {
+		title = pr.Summary
+	}
+	if title == "" {
+		title = fmt.Sprintf("PR #%d", id)
+	}
+	windowID := fmt.Sprintf("bitbucket.summarize.%d", id)
+	return &performActionResult{
+		Success: true,
+		Window: &pluginWindow{
+			ID:       windowID,
+			Title:    title,
+			Subtitle: "Bitbucket",
+			IconHint: "arrow.triangle.pull",
+			Sections: []pluginWindowSection{{
+				ID:    "loading",
+				Title: "Summary",
+				Blocks: []pluginWindowBlock{{
+					ID:    "generating",
+					Text:  "Generating summary...",
+					Style: "paragraph",
+				}},
+			}},
+		},
+		AI: &pluginAIAssist{
+			Task:         "summarize_bullets",
+			Input:        diffResult.Data,
+			WindowID:     windowID,
+			SectionTitle: "Summary",
+		},
+	}, nil
 }
 
 func (p *bitbucketPlugin) fetchRaw(urlStr string) (string, error) {
@@ -940,7 +1027,7 @@ func (p *bitbucketPlugin) doAPI(method, urlStr string) (*http.Response, error) {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "smuler-bitbucket-plugin/0.1.1")
+	req.Header.Set("User-Agent", "smuler-bitbucket-plugin/0.1.2")
 	p.auth.apply(req)
 	return p.client.Do(req)
 }

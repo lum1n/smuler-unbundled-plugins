@@ -1,7 +1,7 @@
 {
   "id": "bitbucket",
   "name": "Bitbucket",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pull requests, review requests, and pipeline status from Bitbucket Cloud",
   "icon": {
     "type": "sfSymbol",
@@ -11,7 +11,9 @@
   "capabilities": [
     "summary",
     "items",
-    "alerts"
+    "actions",
+    "alerts",
+    "windows"
   ],
   "domains": [
     "pr",

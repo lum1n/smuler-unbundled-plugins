@@ -15,6 +15,7 @@ import (
 type Handler interface {
 	// PerformAction is called when the host sends a "performAction" request.
 	// Return true + optional data on success, or false + error message on failure.
+	// Prefer ActionResultHandler when returning structured window content.
 	PerformAction(id string, params map[string]string) (bool, string)
 	// Initialize is called when the host sends the "initialize" handshake.
 	// Return the initial health string (e.g. HealthOK).
@@ -27,6 +28,13 @@ type Handler interface {
 
 	// Shutdown is called when the host requests graceful shutdown.
 	Shutdown()
+}
+
+// ActionResultHandler is an optional extension for plugins that return
+// structured ActionResult values (including host-rendered windows).
+// When implemented, it takes precedence over Handler.PerformAction.
+type ActionResultHandler interface {
+	PerformActionResult(id string, params map[string]string) ActionResult
 }
 
 // --- package-level API for plugin authors ---
@@ -181,16 +189,16 @@ func Run(pluginID, pluginVersion string, handler Handler) {
 				sendError(req.ID, -32602, "performAction missing actionId", false, "Retry the action.")
 				continue
 			}
-			success, data := handler.PerformAction(actionID, payload)
-			result := struct {
-				Success bool   `json:"success"`
-				Data    string `json:"data,omitempty"`
-				Error   string `json:"error,omitempty"`
-			}{Success: success, Data: data}
-			if !success {
-				result.Error = data
+			if richer, ok := handler.(ActionResultHandler); ok {
+				sendResult(req.ID, richer.PerformActionResult(actionID, payload))
+			} else {
+				success, data := handler.PerformAction(actionID, payload)
+				result := ActionResult{Success: success, Data: data}
+				if !success {
+					result.Error = data
+				}
+				sendResult(req.ID, result)
 			}
-			sendResult(req.ID, result)
 		case "shutdown":
 			handler.Shutdown()
 			sendResult(req.ID, nil)

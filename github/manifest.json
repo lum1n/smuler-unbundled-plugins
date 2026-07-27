@@ -1,7 +1,7 @@
 {
   "id": "github",
   "name": "GitHub",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "GitHub reviews, pull requests, and notifications",
   "icon": {
     "type": "sfSymbol",
@@ -12,7 +12,8 @@
     "summary",
     "items",
     "actions",
-    "alerts"
+    "alerts",
+    "windows"
   ],
   "domains": [
     "pr"

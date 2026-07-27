@@ -188,6 +188,115 @@ func TestRPCRequestParsing(t *testing.T) {
 	}
 }
 
+func TestActionResultWithWindow(t *testing.T) {
+	result := ActionWindow(WindowContent{
+		ID:       "demo.window",
+		Title:    "Demo",
+		Subtitle: "Plugin",
+		IconHint: "doc.text",
+		Sections: []WindowSection{
+			{
+				ID:    "main",
+				Title: "Notes",
+				Blocks: []WindowBlock{
+					{ID: "1", Text: "First", Style: WindowBlockBullet},
+					{ID: "2", Text: "code sample", Style: WindowBlockCode},
+				},
+			},
+		},
+	})
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded ActionResult
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !decoded.Success {
+		t.Fatal("expected success")
+	}
+	if decoded.Window == nil {
+		t.Fatal("expected window")
+	}
+	if decoded.Window.ID != "demo.window" {
+		t.Errorf("window.id: got %q", decoded.Window.ID)
+	}
+	if len(decoded.Window.Sections) != 1 || len(decoded.Window.Sections[0].Blocks) != 2 {
+		t.Fatalf("unexpected sections/blocks: %+v", decoded.Window.Sections)
+	}
+	if decoded.Window.Sections[0].Blocks[0].Style != WindowBlockBullet {
+		t.Errorf("block style: got %q", decoded.Window.Sections[0].Blocks[0].Style)
+	}
+}
+
+func TestActionResultWithAIWindow(t *testing.T) {
+	window := WindowContent{
+		ID:       "demo.summarize",
+		Title:    "Demo",
+		IconHint: "doc.text",
+		Sections: []WindowSection{{
+			ID:    "loading",
+			Title: "Summary",
+			Blocks: []WindowBlock{{ID: "generating", Text: "Generating summary...", Style: WindowBlockParagraph}},
+		}},
+	}
+	result := ActionAIWindow(window, AIAssist{
+		Task:         AITaskSummarizeBullets,
+		Input:        "diff --git a/x",
+		WindowID:     window.ID,
+		SectionTitle: "Summary",
+	})
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded ActionResult
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.AI == nil || decoded.AI.Task != AITaskSummarizeBullets {
+		t.Fatalf("ai: %+v", decoded.AI)
+	}
+	if decoded.AI.WindowID != "demo.summarize" {
+		t.Errorf("ai.windowId: got %q", decoded.AI.WindowID)
+	}
+}
+
+func TestActionAITaskHelpers(t *testing.T) {
+	tasks := []string{
+		AITaskSummarizeBullets,
+		AITaskExplain,
+		AITaskRiskReview,
+		AITaskTriageNext,
+		AITaskDraftReply,
+		AITaskExtractActions,
+	}
+	for _, task := range tasks {
+		result := ActionAITask(AIWindowOpts{
+			ID:    "demo." + task,
+			Title: "Demo",
+			Task:  task,
+			Input: "sample input",
+		})
+		if result.Window == nil || result.AI == nil {
+			t.Fatalf("task %s: missing window/ai", task)
+		}
+		if result.AI.Task != task {
+			t.Errorf("task %s: ai.task=%q", task, result.AI.Task)
+		}
+		if result.Window.Sections[0].ID != "loading" {
+			t.Errorf("task %s: expected loading section", task)
+		}
+		if AITaskSectionTitle(task) == "" || AITaskLoadingLabel(task) == "" {
+			t.Errorf("task %s: empty labels", task)
+		}
+	}
+}
+
 func TestRPCResponseMarshaling(t *testing.T) {
 	resp := rpcResponse{
 		JSONRPC: "2.0",

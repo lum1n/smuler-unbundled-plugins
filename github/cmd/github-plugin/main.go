@@ -21,7 +21,7 @@ func logDebug(format string, args ...interface{}) {
 
 const (
 	protocolVersion = "0.1.0"
-	pluginVersion   = "0.1.0"
+	pluginVersion   = "0.1.1"
 	apiBase         = "https://api.github.com"
 )
 
@@ -119,6 +119,41 @@ type pluginAlert struct {
 	Message  string `json:"message"`
 }
 
+type performActionResult struct {
+	Success bool            `json:"success"`
+	Data    string          `json:"data,omitempty"`
+	Error   string          `json:"error,omitempty"`
+	Window  *pluginWindow   `json:"window,omitempty"`
+	AI      *pluginAIAssist `json:"ai,omitempty"`
+}
+
+type pluginWindow struct {
+	ID       string                `json:"id"`
+	Title    string                `json:"title"`
+	Subtitle string                `json:"subtitle,omitempty"`
+	IconHint string                `json:"iconHint,omitempty"`
+	Sections []pluginWindowSection `json:"sections"`
+}
+
+type pluginWindowSection struct {
+	ID     string              `json:"id"`
+	Title  string              `json:"title,omitempty"`
+	Blocks []pluginWindowBlock `json:"blocks"`
+}
+
+type pluginWindowBlock struct {
+	ID    string `json:"id"`
+	Text  string `json:"text"`
+	Style string `json:"style,omitempty"`
+}
+
+type pluginAIAssist struct {
+	Task         string `json:"task"`
+	Input        string `json:"input"`
+	WindowID     string `json:"windowId"`
+	SectionTitle string `json:"sectionTitle,omitempty"`
+}
+
 type pluginEvent struct {
 	Type      string            `json:"type"`
 	PluginID  string            `json:"pluginId"`
@@ -165,6 +200,7 @@ type prevPRInfo struct {
 type prMeta struct {
 	number int
 	repo   string // owner/repo
+	title  string
 }
 
 type githubPlugin struct {
@@ -204,7 +240,7 @@ func (p *githubPlugin) apiRequestRaw(path string, acceptHeader string) (httpResp
 	} else {
 		req.Header.Set("Accept", "application/vnd.github.v3+json")
 	}
-	req.Header.Set("User-Agent", "smuler-github-plugin/0.1.0")
+	req.Header.Set("User-Agent", "smuler-github-plugin/0.1.1")
 	if p.token != "" {
 		req.Header.Set("Authorization", "token "+p.token)
 	}
@@ -252,6 +288,51 @@ func (p *githubPlugin) handleGetMRDiff(idStr string) (bool, string) {
 		return false, fmt.Sprintf("Failed to fetch diff: %v", err)
 	}
 	return true, diff
+}
+
+func (p *githubPlugin) handleSummarize(idStr string) *performActionResult {
+	meta, ok := p.prMetaMap[idStr]
+	if !ok {
+		return &performActionResult{Success: false, Error: fmt.Sprintf("PR not found in cache: %s", idStr)}
+	}
+
+	diff, err := p.fetchPRDiff(meta.repo, meta.number)
+	if err != nil {
+		return &performActionResult{Success: false, Error: fmt.Sprintf("Failed to fetch diff: %v", err)}
+	}
+	if strings.TrimSpace(diff) == "" {
+		return &performActionResult{Success: false, Error: "Empty diff"}
+	}
+
+	title := meta.title
+	if title == "" {
+		title = fmt.Sprintf("PR #%d", meta.number)
+	}
+	windowID := fmt.Sprintf("github.summarize.%s", idStr)
+	return &performActionResult{
+		Success: true,
+		Window: &pluginWindow{
+			ID:       windowID,
+			Title:    title,
+			Subtitle: "GitHub",
+			IconHint: "arrow.triangle.pull",
+			Sections: []pluginWindowSection{{
+				ID:    "loading",
+				Title: "Summary",
+				Blocks: []pluginWindowBlock{{
+					ID:    "generating",
+					Text:  "Generating summary...",
+					Style: "paragraph",
+				}},
+			}},
+		},
+		AI: &pluginAIAssist{
+			Task:         "summarize_bullets",
+			Input:        diff,
+			WindowID:     windowID,
+			SectionTitle: "Summary",
+		},
+	}
 }
 
 func (p *githubPlugin) buildSnapshot() pluginSnapshot {
@@ -370,6 +451,7 @@ func (p *githubPlugin) buildSnapshot() pluginSnapshot {
 		p.prMetaMap[itemID] = prMeta{
 			number: pr.Number,
 			repo:   repo,
+			title:  pr.Title,
 		}
 		items = append(items, pluginItem{
 			ID:        itemID,
@@ -592,10 +674,10 @@ func main() {
 			case "getMRDiff":
 				idStr := strings.TrimSpace(actionParams.Payload["id"])
 				success, data := pl.handleGetMRDiff(idStr)
-				sendResult(req.ID, struct {
-					Success bool   `json:"success"`
-					Data    string `json:"data,omitempty"`
-				}{success, data})
+				sendResult(req.ID, performActionResult{Success: success, Data: data})
+			case "summarize":
+				idStr := strings.TrimSpace(actionParams.Payload["id"])
+				sendResult(req.ID, pl.handleSummarize(idStr))
 			default:
 				sendError(req.ID, -32601, fmt.Sprintf("unknown action: %s", actionParams.ActionID), false, "")
 			}
