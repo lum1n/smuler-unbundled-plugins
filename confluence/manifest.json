@@ -159,7 +159,7 @@
       "storageProviderId": "confluence",
       "displayName": "Cookie Auth",
       "authKind": "browser_import",
-      "description": "Import a signed-in browser session cookie for your Confluence domain. Set the domain above first, then sign in and close the window.",
+      "description": "Import a signed-in browser session for your Confluence domain. Set the domain above first, then sign in and close the window.",
       "deepLink": "https://id.atlassian.com/login",
       "showEnableToggle": false,
       "allowMultipleAccounts": false,

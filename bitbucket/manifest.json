@@ -167,7 +167,7 @@
       "storageProviderId": "bitbucket",
       "displayName": "Cookie Auth",
       "authKind": "browser_import",
-      "description": "Import a signed-in browser session cookie. Sign in, wait for the page to load, then close the window. Required for Bitbucket Server; also works for Bitbucket Cloud.",
+      "description": "Import a signed-in browser session. Sign in, wait for the page to load, then close the window. Works for Bitbucket Cloud and Server.",
       "deepLink": "https://bitbucket.org/dashboard/workspaces",
       "showEnableToggle": false,
       "allowMultipleAccounts": false,
