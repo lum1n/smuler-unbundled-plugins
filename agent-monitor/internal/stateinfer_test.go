@@ -74,3 +74,15 @@ func TestMergeAgentState(t *testing.T) {
 		t.Fatalf("got %q, want question", got)
 	}
 }
+
+func TestOverlayWatcherStateBeatsStaleIdle(t *testing.T) {
+	if got := OverlayWatcherState("idle", "question"); got != "question" {
+		t.Fatalf("got %q", got)
+	}
+	if got := OverlayWatcherState("unbound", "question"); got != "question" {
+		t.Fatalf("got %q", got)
+	}
+	if got := OverlayWatcherState("thinking", "working"); got != "thinking" {
+		t.Fatalf("got %q, want thinking (watcher wins)", got)
+	}
+}

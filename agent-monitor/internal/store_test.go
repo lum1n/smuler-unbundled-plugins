@@ -78,6 +78,21 @@ func TestAgentStore_RemoveCompletedOlderThan(t *testing.T) {
 	}
 }
 
+func TestAgentStore_WatcherOwnsPID(t *testing.T) {
+	s := NewAgentStore()
+	s.Upsert(AgentSession{ID: "tmux:dev:w0", AgentID: "claude", PID: 7, State: "idle", Source: SourceTmux})
+	s.Upsert(AgentSession{ID: "claude-9", AgentID: "claude", PID: 9, State: "running", Source: SourceProc})
+	if !s.WatcherOwnsPID(7) {
+		t.Fatal("expected watcher to own pane pid")
+	}
+	if s.WatcherOwnsPID(9) {
+		t.Fatal("proc pid is not watcher-owned")
+	}
+	if s.ResolveHookID("claude", 7) != "tmux:dev:w0" {
+		t.Fatal(s.ResolveHookID("claude", 7))
+	}
+}
+
 func TestAgentStore_HistoryLimit(t *testing.T) {
 	s := NewAgentStore()
 	for i := 0; i < 60; i++ {

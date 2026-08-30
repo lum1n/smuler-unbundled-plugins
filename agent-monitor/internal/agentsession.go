@@ -2,6 +2,11 @@ package internal
 
 import "time"
 
+const (
+	SourceTmux = "tmux"
+	SourceProc = "proc"
+)
+
 // TodoItem tracks a single task inside an agent session.
 type TodoItem struct {
 	Content  string `json:"content"`
@@ -46,6 +51,11 @@ type AgentSession struct {
 	UpdatedAt    int64  `json:"updatedAt"`    // ms since epoch
 	ExitCode     *int   `json:"exitCode,omitempty"`
 	Available    bool   `json:"available"`    // true when context reader found data
+	Source       string `json:"source,omitempty"` // tmux | proc
+	TmuxSession  string `json:"tmuxSession,omitempty"`
+	TmuxWindow   int    `json:"tmuxWindow,omitempty"`
+	WatcherPath  string `json:"watcherPath,omitempty"`
+	Unbound      bool   `json:"unbound,omitempty"`
 }
 
 // IsTerminalState returns true when the agent has finished.
