@@ -41,10 +41,12 @@ CHECK_ONLY=0
 DO_RELEASE=0
 DO_SUBMIT=0
 DRY_RUN=0
+UNPUBLISHED_ONLY=0
 TAG=""
 REPO=""
 RELEASE_NOTES="First-party registry plugin packages"
 OUT_DIR="$ROOT/.build/registry-plugins"
+REGISTRY_REPO="${SMULER_REGISTRY_REPO:-lum1n/smuler-registry}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -72,6 +74,7 @@ Options:
   --notes TEXT       Release notes body
   --out-dir DIR      Staging directory for archives (default: .build/registry-plugins)
   --dry-run          Print actions without writing/signing/releasing
+  --unpublished-only Only plugins whose local version is newer than smuler-registry
   -h, --help         Show this help
 
 Plugins default to the full registry set. Pass ids to limit the batch.
@@ -79,6 +82,7 @@ Plugins default to the full registry set. Pass ids to limit the batch.
 Examples:
   make registry-plugins-publish
   ./publish-registry-plugins.sh --check
+  ./publish-registry-plugins.sh --unpublished-only --release --submit
   ./publish-registry-plugins.sh --release --tag plugins-v0.1.0
   ./publish-registry-plugins.sh --release --submit github linear
 EOF
@@ -92,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --release) DO_RELEASE=1; shift ;;
     --submit) DO_SUBMIT=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --unpublished-only) UNPUBLISHED_ONLY=1; shift ;;
     --tag) TAG="${2:-}"; [[ -n "$TAG" ]] || die "--tag requires a value"; shift 2 ;;
     --repo) REPO="${2:-}"; [[ -n "$REPO" ]] || die "--repo requires a value"; shift 2 ;;
     --notes) RELEASE_NOTES="${2:-}"; [[ -n "$RELEASE_NOTES" ]] || die "--notes requires a value"; shift 2 ;;
@@ -106,6 +111,23 @@ while [[ $# -gt 0 ]]; do PLUGINS+=("$1"); shift; done
 if [[ ${#PLUGINS[@]} -eq 0 ]]; then
   PLUGINS=("${DEFAULT_PLUGINS[@]}")
 fi
+
+filter_unpublished() {
+  [[ "$UNPUBLISHED_ONLY" -eq 1 ]] || return 0
+  local helper="$ROOT/scripts/unpublished-plugins.py"
+  [[ -f "$helper" ]] || die "missing $helper"
+  local filtered=()
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && filtered+=("$line")
+  done < <(python3 "$helper" --root "$ROOT" "${PLUGINS[@]}")
+  if [[ ${#filtered[@]} -eq 0 ]]; then
+    info "No unpublished plugin versions vs registry — nothing to do"
+    exit 0
+  fi
+  info "Unpublished vs registry: ${filtered[*]}"
+  PLUGINS=("${filtered[@]}")
+}
 
 run() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -426,9 +448,14 @@ submit_registry() {
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" RETURN
 
-  info "Submitting ${#ENTRIES[@]} entries to lum1n/smuler-registry (branch $branch)"
+  local submit_token="${SMULER_REGISTRY_TOKEN:-${GH_TOKEN:-}}"
+  if [[ "$DRY_RUN" -eq 0 && -z "$submit_token" ]]; then
+    die "SMULER_REGISTRY_TOKEN (or GH_TOKEN) required for --submit to ${REGISTRY_REPO}"
+  fi
+
+  info "Submitting ${#ENTRIES[@]} entries to ${REGISTRY_REPO} (branch $branch)"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "+ gh repo clone lum1n/smuler-registry $tmp -- --depth=1"
+    log "+ gh repo clone $REGISTRY_REPO $tmp -- --depth=1"
     for entry in "${ENTRIES[@]}"; do
       log "+ copy $entry -> submissions/plugins/$(basename "$entry")"
     done
@@ -436,7 +463,9 @@ submit_registry() {
     return 0
   fi
 
-  gh repo clone lum1n/smuler-registry "$tmp" -- --depth=1
+  GH_TOKEN="$submit_token" gh repo clone "$REGISTRY_REPO" "$tmp" -- --depth=1
+  git -C "$tmp" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+  git -C "$tmp" config user.name "github-actions[bot]"
   git -C "$tmp" checkout -b "$branch"
   mkdir -p "$tmp/submissions/plugins"
 
@@ -448,10 +477,11 @@ submit_registry() {
   done
 
   git -C "$tmp" commit -m "Submit first-party plugins (${TAG:-batch})"
-  git -C "$tmp" push -u origin "$branch"
+  GH_TOKEN="$submit_token" git -C "$tmp" push -u origin "$branch"
   (
     cd "$tmp"
-    gh pr create \
+    GH_TOKEN="$submit_token" gh pr create \
+      --repo "$REGISTRY_REPO" \
       --title "Submit first-party plugins (${TAG:-batch})" \
       --body "$(cat <<EOF
 Automated batch submission from \`publish-registry-plugins.sh\`.
@@ -467,6 +497,8 @@ EOF
 }
 
 # --- main ---
+# Filter first so a no-op publish does not require the signing key.
+filter_unpublished
 ensure_prereqs
 REPO="$(detect_repo)"
 if [[ -z "$TAG" ]]; then

@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      plugins:
+        description: Optional space-separated plugin ids (default: unpublished vs registry)
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk-go/go.mod
+          cache-dependency-path: |
+            **/go.sum
+            **/go.mod
+
+      - name: Test helpers and plugins
+        run: make registry-plugins-test
+
+      - name: Build registry plugins
+        run: make registry-plugins-build
+
+  publish:
+    if: >
+      github.repository == 'lum1n/smuler-unbundled-plugins' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: test
+    runs-on: macos-14
+    environment: publish
+    concurrency:
+      group: registry-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk-go/go.mod
+          cache-dependency-path: |
+            **/go.sum
+            **/go.mod
+
+      - name: Install signing key
+        id: key
+        env:
+          SMULER_PLUGIN_SIGNING_KEY: ${{ secrets.SMULER_PLUGIN_SIGNING_KEY }}
+        run: |
+          if [[ -z "${SMULER_PLUGIN_SIGNING_KEY}" ]]; then
+            echo "SMULER_PLUGIN_SIGNING_KEY is not set on the publish environment; skipping publish."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "${HOME}/.config/smuler/keys"
+          printf '%s\n' "${SMULER_PLUGIN_SIGNING_KEY}" > "${HOME}/.config/smuler/keys/smuler_ed25519"
+          chmod 600 "${HOME}/.config/smuler/keys/smuler_ed25519"
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish unpublished plugins
+        if: steps.key.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMULER_REGISTRY_TOKEN: ${{ secrets.SMULER_REGISTRY_TOKEN }}
+          DISPATCH_PLUGINS: ${{ inputs.plugins }}
+          RELEASE_TAG: plugins-${{ github.run_id }}
+          RELEASE_NOTES: Automated publish from ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SMULER_REGISTRY_TOKEN}" ]]; then
+            echo "SMULER_REGISTRY_TOKEN is not set; cannot open a smuler-registry PR."
+            exit 1
+          fi
+          plugins=()
+          if [[ -n "${DISPATCH_PLUGINS:-}" ]]; then
+            read -r -a plugins <<< "${DISPATCH_PLUGINS}"
+            for id in "${plugins[@]}"; do
+              if [[ ! "$id" =~ ^[a-z0-9-]+$ ]]; then
+                echo "invalid plugin id: $id"
+                exit 1
+              fi
+            done
+          fi
+          ./publish-registry-plugins.sh \
+            --unpublished-only \
+            --release \
+            --submit \
+            --tag "${RELEASE_TAG}" \
+            --notes "${RELEASE_NOTES}" \
+            "${plugins[@]}"
