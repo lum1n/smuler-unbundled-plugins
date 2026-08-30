@@ -464,6 +464,9 @@ submit_registry() {
   fi
 
   GH_TOKEN="$submit_token" gh repo clone "$REGISTRY_REPO" "$tmp" -- --depth=1
+  # gh clone authenticates the clone, not later `git push`. Install the
+  # credential helper so push uses SMULER_REGISTRY_TOKEN / GH_TOKEN.
+  GH_TOKEN="$submit_token" gh auth setup-git
   git -C "$tmp" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
   git -C "$tmp" config user.name "github-actions[bot]"
   git -C "$tmp" checkout -b "$branch"
@@ -477,7 +480,7 @@ submit_registry() {
   done
 
   git -C "$tmp" commit -m "Submit first-party plugins (${TAG:-batch})"
-  GH_TOKEN="$submit_token" git -C "$tmp" push -u origin "$branch"
+  GH_TOKEN="$submit_token" git -C "$tmp" push -u origin "HEAD:refs/heads/${branch}"
   (
     cd "$tmp"
     GH_TOKEN="$submit_token" gh pr create \
