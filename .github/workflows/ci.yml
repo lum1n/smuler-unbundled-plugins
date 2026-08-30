@@ -96,20 +96,30 @@ jobs:
             echo "SMULER_REGISTRY_TOKEN is not set; cannot open a smuler-registry PR."
             exit 1
           fi
-          plugins=()
+          extra=()
           if [[ -n "${DISPATCH_PLUGINS:-}" ]]; then
-            read -r -a plugins <<< "${DISPATCH_PLUGINS}"
-            for id in "${plugins[@]}"; do
+            read -r -a extra <<< "${DISPATCH_PLUGINS}"
+            for id in "${extra[@]}"; do
               if [[ ! "$id" =~ ^[a-z0-9-]+$ ]]; then
                 echo "invalid plugin id: $id"
                 exit 1
               fi
             done
           fi
-          ./publish-registry-plugins.sh \
-            --unpublished-only \
-            --release \
-            --submit \
-            --tag "${RELEASE_TAG}" \
-            --notes "${RELEASE_NOTES}" \
-            "${plugins[@]}"
+          # Bash + set -u treats "${empty[@]}" as unbound; omit the extra args when unused.
+          if [[ ${#extra[@]} -eq 0 ]]; then
+            ./publish-registry-plugins.sh \
+              --unpublished-only \
+              --release \
+              --submit \
+              --tag "${RELEASE_TAG}" \
+              --notes "${RELEASE_NOTES}"
+          else
+            ./publish-registry-plugins.sh \
+              --unpublished-only \
+              --release \
+              --submit \
+              --tag "${RELEASE_TAG}" \
+              --notes "${RELEASE_NOTES}" \
+              "${extra[@]}"
+          fi
