@@ -24,12 +24,14 @@ func NewProcDetector(store *AgentStore, interval time.Duration) *ProcDetector {
 	return &ProcDetector{
 		store: store,
 		execs: map[string]string{
-			"archer":   "archer",
-			"claude":   "claude",
-			"opencode": "opencode",
-			"codex":    "codex",
-			"pi":       "pi",
-			"aider":    "aider",
+			"archer":        "archer",
+			"claude":        "claude",
+			"opencode":      "opencode",
+			"codex":         "codex",
+			"pi":            "pi",
+			"aider":         "aider",
+			"cursor":        "cursor",
+			"cursor-agent":  "cursor",
 		},
 		interval: interval,
 		done:     make(chan struct{}),
@@ -89,6 +91,12 @@ func (pd *ProcDetector) matchAndRecord(args []string, pid int, ppid int, seen ma
 	if !ok {
 		return
 	}
+	if pd.store.WatcherOwnsPID(pid) || pd.store.WatcherOwnsPID(ppid) {
+		return
+	}
+	if existing := pd.store.FindByPID(pid); existing != nil && existing.Source == SourceTmux {
+		return
+	}
 	id := agentID + "-" + strconv.Itoa(pid)
 
 	existing := pd.store.Get(id)
@@ -138,6 +146,7 @@ func (pd *ProcDetector) matchAndRecord(args []string, pid int, ppid int, seen ma
 		Command: strings.Join(args, " "),
 		State:   "running",
 		PID:     pid,
+		Source:  SourceProc,
 	})
 }
 

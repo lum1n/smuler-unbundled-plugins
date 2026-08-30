@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -103,19 +102,27 @@ func (sl *SocketListener) handleConn(conn net.Conn) {
 }
 
 func (sl *SocketListener) process(ev SocketEvent) {
-	id := ev.AgentID + "-" + strconv.Itoa(ev.PID)
+	id := sl.store.ResolveHookID(ev.AgentID, ev.PID)
+	existing := sl.store.Get(id)
 	switch ev.Type {
 	case "agent_start":
-		if sl.store.Get(id) == nil {
+		if existing == nil {
 			sl.store.AddHistory(ev.AgentID, ev.Command, "started", "", time.Now().UnixMilli())
+		}
+		state := "running"
+		source := SourceProc
+		if existing != nil && existing.Source == SourceTmux {
+			state = OverlayWatcherState(existing.State, "running")
+			source = SourceTmux
 		}
 		sl.store.Upsert(AgentSession{
 			ID:          id,
 			AgentID:     ev.AgentID,
 			DisplayName: ev.AgentName,
 			Command:     ev.Command,
-			State:       "running",
+			State:       state,
 			PID:         ev.PID,
+			Source:      source,
 		})
 
 	case "agent_end":
@@ -127,23 +134,35 @@ func (sl *SocketListener) process(ev SocketEvent) {
 		if existing != nil {
 			sl.store.AddHistory(existing.AgentID, existing.Command, state, existing.Task, time.Now().UnixMilli())
 		}
+		source := SourceProc
+		if existing != nil && existing.Source == SourceTmux {
+			source = SourceTmux
+		}
 		sl.store.Upsert(AgentSession{
 			ID:       id,
 			State:    state,
 			PID:      ev.PID,
 			ExitCode: ev.ExitCode,
+			Source:   source,
 		})
 		log.Printf("[agent-monitor] agent %s ended with state=%s exitCode=%v", ev.AgentID, state, ev.ExitCode)
 
 	case "agent_question":
+		state := "question"
+		source := SourceProc
+		if existing != nil && existing.Source == SourceTmux {
+			state = OverlayWatcherState(existing.State, "question")
+			source = SourceTmux
+		}
 		sl.store.Upsert(AgentSession{
 			ID:           id,
 			AgentID:      ev.AgentID,
 			DisplayName:  ev.AgentName,
-			State:        "question",
+			State:        state,
 			Task:         ev.Message,
 			QuestionText: ev.QuestionText,
 			PID:          ev.PID,
+			Source:       source,
 		})
 		log.Printf("[agent-monitor] agent %s needs attention: %s", ev.AgentID, ev.Message)
 
@@ -151,6 +170,11 @@ func (sl *SocketListener) process(ev SocketEvent) {
 		state := ev.State
 		if state == "" {
 			state = "running"
+		}
+		source := SourceProc
+		if existing != nil && existing.Source == SourceTmux {
+			state = OverlayWatcherState(existing.State, state)
+			source = SourceTmux
 		}
 		sl.store.Upsert(AgentSession{
 			ID:           id,
@@ -163,6 +187,7 @@ func (sl *SocketListener) process(ev SocketEvent) {
 			CurrentTool:  ev.Tool,
 			SessionID:    ev.SessionID,
 			PID:          ev.PID,
+			Source:       source,
 		})
 		log.Printf("[agent-monitor] agent %s status: %s (label: %s)", ev.AgentID, state, ev.Label)
 	}

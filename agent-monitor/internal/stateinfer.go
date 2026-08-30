@@ -66,3 +66,18 @@ func MergeAgentState(existing, incoming string) string {
 	}
 	return incoming
 }
+
+// OverlayWatcherState applies reader/hook state onto a watcher-owned session.
+// Watcher state wins unless the watcher row is idle/unbound and incoming is question.
+func OverlayWatcherState(watcherState, incoming string) string {
+	if watcherState == "" {
+		return incoming
+	}
+	if incoming == "" {
+		return watcherState
+	}
+	if incoming == "question" && (watcherState == "idle" || watcherState == "running" || watcherState == "unbound") {
+		return incoming
+	}
+	return watcherState
+}

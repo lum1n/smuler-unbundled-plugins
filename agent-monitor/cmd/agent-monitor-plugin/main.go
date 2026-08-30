@@ -13,12 +13,13 @@ import (
 	"github.com/lum1n/smuler/plugins/agent-monitor/internal"
 	"github.com/lum1n/smuler/plugins/agent-monitor/internal/drift"
 	"github.com/lum1n/smuler/plugins/agent-monitor/internal/rules"
+	"github.com/lum1n/smuler/plugins/agent-monitor/internal/watcher"
 	"github.com/lum1n/smuler/plugins/sdk-go"
 )
 
 const (
 	pluginID      = "agent-monitor"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.2.0"
 )
 
 type handler struct {
@@ -35,6 +36,8 @@ type handler struct {
 	piReader      *internal.PiContextReader
 	rulesScanner  *rules.Scanner
 	driftAnalyzer *drift.Analyzer
+	watcher       *watcher.Client
+	health        string
 }
 
 func newHandler() *handler {
@@ -52,6 +55,7 @@ func newHandler() *handler {
 		piReader:      internal.NewPiContextReader(),
 		rulesScanner:  rules.NewScanner(),
 		driftAnalyzer: drift.NewAnalyzer(),
+		health:        sdk.HealthOK,
 	}
 }
 
@@ -293,7 +297,15 @@ func (h *handler) Initialize(params sdk.InitializeParams) string {
 
 	if err := h.socket.Start(); err != nil {
 		sdk.Log("socket start failed: %v", err)
+		h.health = sdk.HealthDegraded
 		return sdk.HealthDegraded
+	}
+
+	if interval := params.Config["agent.pollInterval"]; interval != "" {
+		if n, err := strconv.Atoi(interval); err == nil && n > 0 {
+			h.procdetect.Stop()
+			h.procdetect = internal.NewProcDetector(h.store, time.Duration(n)*time.Second)
+		}
 	}
 	h.procdetect.Start()
 	if err := h.cli.Install(); err != nil {
@@ -302,7 +314,40 @@ func (h *handler) Initialize(params sdk.InitializeParams) string {
 	if err := h.cxh.Install(); err != nil {
 		sdk.Log("codex hook install failed: %v", err)
 	}
-	return sdk.HealthOK
+
+	h.startWatcher(params)
+	return h.health
+}
+
+func (h *handler) startWatcher(params sdk.InitializeParams) {
+	enabled := true
+	if v := params.Config["agent.watcherEnabled"]; v == "false" || v == "0" {
+		enabled = false
+	}
+	python := params.Config["agent.pythonPath"]
+	explicit := params.Config["agent.watcherScript"]
+
+	exe, _ := os.Executable()
+	root := watcher.PluginRootFromExe(exe)
+	script := watcher.ResolveScript(root, explicit)
+
+	env := watcher.DefaultEnv()
+	h.watcher = watcher.NewClient(watcher.Config{
+		Enabled:    enabled,
+		PythonPath: python,
+		ScriptPath: script,
+		Env:        env,
+		Log:        sdk.Log,
+		OnEvent: func(ev watcher.Event) {
+			internal.IngestWatcherEvent(h.store, ev, env.LookupPane)
+		},
+	})
+	h.watcher.Start()
+
+	if enabled && env.TmuxAvailable != nil && env.TmuxAvailable() && script == "" {
+		sdk.Log("agent-watcher script not found; tmux agents need python3 + vendored watcher")
+		h.health = sdk.HealthDegraded
+	}
 }
 
 func (h *handler) GetStatus() sdk.Snapshot {
@@ -412,7 +457,7 @@ func (h *handler) GetStatus() sdk.Snapshot {
 		}
 
 		actions := []sdk.Action{}
-		if a.PID > 0 && (a.State == "running" || a.State == "question") {
+		if a.PID > 0 && (a.State == "running" || a.State == "idle" || a.State == "question" || a.State == "working" || a.State == "thinking") {
 			pidStr := strconv.Itoa(a.PID)
 			actions = append(actions,
 				sdk.Action{ID: "stop_agent-" + pidStr, Label: "Stop"},
@@ -517,7 +562,7 @@ func (h *handler) GetStatus() sdk.Snapshot {
 		items = append(items, sdk.Item{
 			ID:       "waiting",
 			Title:    "No agents detected",
-			Subtitle: "Run archer, claude, codex, opencode, or pi in your terminal",
+			Subtitle: "Run a coding agent in a terminal or tmux pane",
 			Severity: sdk.SeverityInfo,
 			Actions:  []sdk.Action{},
 		})
@@ -558,8 +603,18 @@ func (h *handler) GetStatus() sdk.Snapshot {
 		Actions:      dispatchActions,
 		Alerts:       alerts,
 		RefreshAfter: 5,
-		Health:       sdk.HealthOK,
+		Health:       h.snapshotHealth(),
 	}
+}
+
+func (h *handler) snapshotHealth() string {
+	if h.health == sdk.HealthDegraded {
+		return sdk.HealthDegraded
+	}
+	if h.watcher != nil && h.watcher.SpawnFailed() {
+		return sdk.HealthDegraded
+	}
+	return sdk.HealthOK
 }
 
 func (h *handler) setupItems(agents []internal.AgentSession) []sdk.Item {
@@ -864,7 +919,11 @@ func mergeSessionContext(dst *internal.AgentSession, src internal.AgentSession) 
 		dst.Todos = src.Todos
 	}
 	if src.State != "" {
-		dst.State = internal.MergeAgentState(dst.State, src.State)
+		if dst.Source == internal.SourceTmux {
+			dst.State = internal.OverlayWatcherState(dst.State, src.State)
+		} else {
+			dst.State = internal.MergeAgentState(dst.State, src.State)
+		}
 	}
 	if src.QuestionText != "" {
 		dst.QuestionText = src.QuestionText
@@ -938,12 +997,19 @@ func agentMetadata(a internal.AgentSession) map[string]string {
 	if a.QuestionText != "" {
 		m["questionText"] = a.QuestionText
 	}
+	if a.Source != "" {
+		m["source"] = a.Source
+	}
+	if a.TmuxSession != "" {
+		m["tmuxSession"] = a.TmuxSession
+		m["tmuxWindow"] = strconv.Itoa(a.TmuxWindow)
+	}
 	return m
 }
 
 func agentDisplayStatus(state string) string {
 	switch state {
-	case "running":
+	case "running", "idle":
 		return "idle"
 	case "working":
 		return "working"
@@ -963,6 +1029,9 @@ func agentDisplayStatus(state string) string {
 }
 
 func (h *handler) Shutdown() {
+	if h.watcher != nil {
+		h.watcher.Stop()
+	}
 	if h.socket != nil {
 		h.socket.Stop()
 	}

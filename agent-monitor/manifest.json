@@ -1,8 +1,8 @@
 {
   "id": "agent-monitor",
   "name": "Agent Monitor",
-  "version": "0.1.1",
-  "description": "Monitors AI coding agents (Claude Code, Codex, OpenCode, Pi, Aider, Archer) from local process and session state, with native hook integration for tool-level status",
+  "version": "0.2.0",
+  "description": "Monitors AI coding agents (Claude Code, Codex, OpenCode, Pi, Cursor, Aider, Archer). Attaches to a shared agent-watcher daemon when tmux-agent-state is present, otherwise starts one; process scan covers agents outside tmux.",
   "icon": {
     "type": "sfSymbol",
     "value": "cpu"
@@ -62,7 +62,21 @@
       "label": "Process scan interval (seconds)",
       "type": "int",
       "default": "5",
-      "help": "How often to scan /proc for agent processes."
+      "help": "How often to scan for agent processes not already reported by agent-watcher."
+    },
+    {
+      "key": "agent.watcherEnabled",
+      "label": "Use agent-watcher",
+      "type": "bool",
+      "default": "true",
+      "help": "Attach to tmux-agent-state / Sessh agent-watcher when present, or start the vendored classifier. Requires Python 3.10+ only when this plugin starts the daemon."
+    },
+    {
+      "key": "agent.pythonPath",
+      "label": "Python for agent-watcher",
+      "type": "string",
+      "default": "python3",
+      "help": "Interpreter used only when smuler starts the agent-watcher daemon (tmux present, no live socket)."
     }
   ]
 }

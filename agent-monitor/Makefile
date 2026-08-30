@@ -23,6 +23,13 @@ install: build
 	cp "$(BINARY)" "$${INSTALL_DIR}/bin/"; \
 	cp "manifest.json" "$${INSTALL_DIR}/"; \
 	if [ -d "hooks" ]; then cp -R "hooks" "$${INSTALL_DIR}/"; fi; \
+	if [ -d "third_party/agent-watcher/src" ]; then \
+		mkdir -p "$${INSTALL_DIR}/watcher"; \
+		cp third_party/agent-watcher/src/agent_watcher.py "$${INSTALL_DIR}/watcher/"; \
+		if [ -d "third_party/agent-watcher/src/harnesses" ]; then \
+			cp -R third_party/agent-watcher/src/harnesses "$${INSTALL_DIR}/watcher/"; \
+		fi; \
+	fi; \
 	echo "Installed to $${INSTALL_DIR}"
 
 clean:

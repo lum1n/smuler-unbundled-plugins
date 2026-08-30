@@ -144,6 +144,27 @@ func (s *AgentStore) Upsert(session AgentSession) {
 	if session.Available {
 		existing.Available = true
 	}
+	if session.QuestionText != "" {
+		existing.QuestionText = session.QuestionText
+	}
+	if session.RepoRoot != "" {
+		existing.RepoRoot = session.RepoRoot
+	}
+	if session.Source != "" {
+		existing.Source = session.Source
+	}
+	if session.TmuxSession != "" {
+		existing.TmuxSession = session.TmuxSession
+		existing.TmuxWindow = session.TmuxWindow
+	}
+	if session.WatcherPath != "" {
+		existing.WatcherPath = session.WatcherPath
+	}
+	if session.Unbound {
+		existing.Unbound = true
+	} else if session.Source == SourceTmux && session.State != "" {
+		existing.Unbound = false
+	}
 }
 
 // Get returns a copy of the session with the given id.
@@ -273,5 +294,75 @@ func (s *AgentStore) MarkRunning(id, agentID, command string, pid int) {
 		Command: command,
 		State:   "running",
 		PID:     pid,
+		Source:  SourceProc,
 	})
+}
+
+// FindByPID returns the first non-terminal session with this PID.
+func (s *AgentStore) FindByPID(pid int) *AgentSession {
+	if pid <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, a := range s.agents {
+		if a.PID == pid && !a.IsTerminalState() {
+			cp := a.Clone()
+			return &cp
+		}
+	}
+	return nil
+}
+
+// WatcherOwnsPID reports whether pid is the pane PID of a tmux-sourced session.
+func (s *AgentStore) WatcherOwnsPID(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, a := range s.agents {
+		if a.Source == SourceTmux && a.PID == pid && !a.IsTerminalState() {
+			return true
+		}
+	}
+	return false
+}
+
+// WatcherPanePIDs returns pane PIDs of live tmux-sourced sessions.
+func (s *AgentStore) WatcherPanePIDs() map[int]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[int]string)
+	for _, a := range s.agents {
+		if a.Source == SourceTmux && a.PID > 0 && !a.IsTerminalState() {
+			out[a.PID] = a.ID
+		}
+	}
+	return out
+}
+
+// RetainWatcherIDs drops tmux-sourced sessions whose ids are not in keep.
+func (s *AgentStore) RetainWatcherIDs(keep map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UnixMilli()
+	for id, a := range s.agents {
+		if a.Source != SourceTmux {
+			continue
+		}
+		if keep[id] {
+			continue
+		}
+		a.State = "completed"
+		a.UpdatedAt = now
+	}
+}
+
+// ResolveHookID maps a hook pid onto an existing watcher session when possible.
+func (s *AgentStore) ResolveHookID(agentID string, pid int) string {
+	if sess := s.FindByPID(pid); sess != nil {
+		return sess.ID
+	}
+	return agentID + "-" + strconv.Itoa(pid)
 }
