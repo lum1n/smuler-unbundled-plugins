@@ -1,7 +1,7 @@
 {
   "id": "github",
   "name": "GitHub",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "GitHub reviews, pull requests, and notifications",
   "icon": {
     "type": "sfSymbol",
