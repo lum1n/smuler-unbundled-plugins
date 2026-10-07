@@ -10,10 +10,10 @@ import (
 type protoWireType uint64
 
 const (
-	protoWireVarint         protoWireType = 0
-	protoWireFixed64        protoWireType = 1
-	protoWireLengthDelim    protoWireType = 2
-	protoWireFixed32        protoWireType = 5
+	protoWireVarint      protoWireType = 0
+	protoWireFixed64     protoWireType = 1
+	protoWireLengthDelim protoWireType = 2
+	protoWireFixed32     protoWireType = 5
 )
 
 type protoReader struct {
@@ -153,12 +153,12 @@ func appendProtoBool(buf []byte, fieldNumber int, value bool) []byte {
 }
 
 type windsurfPlanStatus struct {
-	PlanName                   string
-	DailyQuotaRemainingPercent int
+	PlanName                    string
+	DailyQuotaRemainingPercent  int
 	WeeklyQuotaRemainingPercent int
-	DailyResetAt               time.Time
-	WeeklyResetAt              time.Time
-	PlanEnd                    time.Time
+	DailyResetAt                time.Time
+	WeeklyResetAt               time.Time
+	PlanEnd                     time.Time
 }
 
 func windsurfEncodePlanStatusRequest(authToken string) []byte {

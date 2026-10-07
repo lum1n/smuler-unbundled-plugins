@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -36,7 +37,7 @@ var httpClient = &http.Client{
 }
 
 const (
-	pluginVersion   = "0.1.2"
+	pluginVersion = "0.1.3"
 	pluginID      = "ai-provider"
 )
 
@@ -147,8 +148,8 @@ func splitCSV(raw string) []string {
 // --- AI Provider Plugin ---
 
 type aiProviderPlugin struct {
-	client       *http.Client
 	config       aiProviderConfig
+	providers    []Provider
 	providerAuth map[string][]AuthContext
 	lastSnapshot *sdk.Snapshot
 	prevUsage    map[string]float64 // providerID -> previous usage percent
@@ -157,23 +158,23 @@ type aiProviderPlugin struct {
 // --- Provider priority for tie-breaking ---
 
 var providerPriority = map[string]int{
-	"codex":        0,
-	"claude":       1,
-	"cursor":       2,
-	"commandcode":  3,
-	"gemini":       4,
-	"grok":         5,
-	"windsurf":     6,
-	"opencode-go":  7,
-	"opencode":     8,
-	"openrouter":   9,
-	"copilot":      10,
-	"augment":      11,
-	"factory":      12,
-	"zed":          13,
-	"warp":         14,
-	"devin":        15,
-	"kiro":         16,
+	"codex":       0,
+	"claude":      1,
+	"cursor":      2,
+	"commandcode": 3,
+	"gemini":      4,
+	"grok":        5,
+	"windsurf":    6,
+	"opencode-go": 7,
+	"opencode":    8,
+	"openrouter":  9,
+	"copilot":     10,
+	"augment":     11,
+	"factory":     12,
+	"zed":         13,
+	"warp":        14,
+	"devin":       15,
+	"kiro":        16,
 }
 
 var copilotAccountType = "personal"
@@ -251,102 +252,6 @@ func (p *openRouterProvider) Fetch(ctx context.Context, auth AuthContext) (Provi
 		DeepLink:       "https://openrouter.ai/credits",
 		SummaryValue:   summaryValue,
 		Details:        fmt.Sprintf("$%.2f remaining", remaining),
-		Timestamp:      time.Now().UTC(),
-	}, nil
-}
-
-// --- Claude (Anthropic) Provider ---
-
-type claudeProvider struct{}
-
-func (p *claudeProvider) ID() string          { return "claude" }
-func (p *claudeProvider) DisplayName() string { return "Claude" }
-
-type anthropicUsageResponse struct {
-	UsagePct    float64 `json:"usage_pct"`
-	Limit       int     `json:"limit"`
-	Used        int     `json:"used"`
-	ResetAt     string  `json:"reset_at"`
-	WindowLabel string  `json:"window_label"`
-}
-
-func (p *claudeProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderStatus, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://console.anthropic.com/api/usage", nil)
-	if err != nil {
-		return ProviderStatus{}, err
-	}
-	req.Header.Set("x-api-key", auth.APIKey)
-	if auth.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+auth.AccessToken)
-	}
-	req.Header.Set("User-Agent", "smuler-ai-provider-plugin/0.1.0")
-
-	client := httpClient
-	resp, err := client.Do(req)
-	if err != nil {
-		return ProviderStatus{}, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ProviderStatus{}, err
-	}
-
-	if resp.StatusCode == 404 {
-		return ProviderStatus{
-			ProviderID:  "claude",
-			DisplayName: "Claude",
-			Health:      "degraded",
-			Severity:    "info",
-			Details:     "Usage endpoint not yet available",
-			WindowLabel: "Usage",
-			Timestamp:   time.Now().UTC(),
-		}, nil
-	}
-
-	if resp.StatusCode >= 400 {
-		return ProviderStatus{}, fmt.Errorf("Claude API error (%d): %s", resp.StatusCode, string(body))
-	}
-
-	var usage anthropicUsageResponse
-	if err := json.Unmarshal(body, &usage); err != nil {
-		return ProviderStatus{}, fmt.Errorf("Claude parse error: %w", err)
-	}
-
-	var resetAt time.Time
-	windowLabel := "Weekly usage"
-	if usage.ResetAt != "" {
-		resetAt, _ = time.Parse(time.RFC3339, usage.ResetAt)
-	} else {
-		resetAt = nextSaturday()
-	}
-	if usage.WindowLabel != "" {
-		windowLabel = usage.WindowLabel
-	}
-
-	severity := severityForPercent(usage.UsagePct)
-	summaryValue := fmt.Sprintf("%.0f%%", usage.UsagePct)
-
-	var details string
-	if !resetAt.IsZero() {
-		details = fmt.Sprintf("%.0f%% used, resets in %s", usage.UsagePct, durationUntil(resetAt))
-	} else {
-		details = fmt.Sprintf("%.0f%% used", usage.UsagePct)
-	}
-
-	return ProviderStatus{
-		ProviderID:     "claude",
-		DisplayName:    "Claude",
-		UsagePercent:   usage.UsagePct,
-		RemainingLabel: fmt.Sprintf("%d / %d", usage.Used, usage.Limit),
-		WindowLabel:    windowLabel,
-		ResetAt:        resetAt,
-		Severity:       severity,
-		Health:         "ready",
-		DeepLink:       "https://console.anthropic.com/settings/usage",
-		SummaryValue:   summaryValue,
-		Details:        details,
 		Timestamp:      time.Now().UTC(),
 	}, nil
 }
@@ -1298,12 +1203,12 @@ func (p *cursorProvider) ID() string          { return "cursor" }
 func (p *cursorProvider) DisplayName() string { return "Cursor" }
 
 type cursorPlanUsage struct {
-	Enabled         *bool    `json:"enabled"`
-	Used            *int     `json:"used"`
-	Limit           *int     `json:"limit"`
-	Remaining       *int     `json:"remaining"`
-	AutoPercentUsed *float64 `json:"autoPercentUsed"`
-	APIPercentUsed  *float64 `json:"apiPercentUsed"`
+	Enabled          *bool    `json:"enabled"`
+	Used             *int     `json:"used"`
+	Limit            *int     `json:"limit"`
+	Remaining        *int     `json:"remaining"`
+	AutoPercentUsed  *float64 `json:"autoPercentUsed"`
+	APIPercentUsed   *float64 `json:"apiPercentUsed"`
 	TotalPercentUsed *float64 `json:"totalPercentUsed"`
 }
 
@@ -2003,6 +1908,9 @@ func (p *commandCodeProvider) Fetch(ctx context.Context, auth AuthContext) (Prov
 
 // --- Provider Registry ---
 
+// getAllProviders returns fresh provider instances. The plugin keeps one set
+// for its lifetime (see aiProviderPlugin.providers) so stateful providers such
+// as Claude can cache results and back off across refreshes.
 func getAllProviders() []Provider {
 	return []Provider{
 		&openRouterProvider{},
@@ -2054,23 +1962,51 @@ func durationUntil(t time.Time) string {
 	return fmt.Sprintf("%dm", m)
 }
 
+// providerHTTPError carries the HTTP status so the snapshot builder can map
+// 429s to the rate_limited health state.
+type providerHTTPError struct {
+	StatusCode int
+	msg        string
+}
+
+func (e *providerHTTPError) Error() string { return e.msg }
+
 func formatHTTPError(provider string, statusCode int, body []byte) error {
 	message := strings.TrimSpace(string(body))
-	if message == "" {
-		return fmt.Errorf("%s API error (%d)", provider, statusCode)
-	}
-
 	if strings.Contains(strings.ToLower(message), "<html") {
 		message = extractHTMLTitle(message)
 	}
-
-	message = strings.Join(strings.Fields(message), " ")
-	message = truncateMessage(message, 160)
+	message = truncateMessage(strings.Join(strings.Fields(message), " "), 160)
 	if message == "" {
-		return fmt.Errorf("%s API error (%d)", provider, statusCode)
+		return &providerHTTPError{StatusCode: statusCode, msg: fmt.Sprintf("%s API error (%d)", provider, statusCode)}
 	}
+	return &providerHTTPError{StatusCode: statusCode, msg: fmt.Sprintf("%s API error (%d): %s", provider, statusCode, message)}
+}
 
-	return fmt.Errorf("%s API error (%d): %s", provider, statusCode, message)
+func isRateLimitError(err error) bool {
+	var httpErr *providerHTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusTooManyRequests
+}
+
+// severityFor maps a usage percentage to a host severity using the
+// user-configured thresholds.
+func (p *aiProviderPlugin) severityFor(pct float64) string {
+	if pct >= p.config.CriticalThreshold {
+		return sdk.SeverityCritical
+	}
+	if pct >= p.config.WarningThreshold {
+		return sdk.SeverityWarning
+	}
+	return sdk.SeverityInfo
+}
+
+// validSeverity coerces any value to one the host accepts.
+func validSeverity(s string) string {
+	switch s {
+	case sdk.SeverityInfo, sdk.SeverityWarning, sdk.SeverityCritical:
+		return s
+	}
+	return sdk.SeverityInfo
 }
 
 func extractHTMLTitle(body string) string {
@@ -2217,7 +2153,10 @@ func (p *aiProviderPlugin) emitProviderEvents(results map[string]fetchResult) {
 }
 
 func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
-	allProviders := getAllProviders()
+	if p.providers == nil {
+		p.providers = getAllProviders()
+	}
+	allProviders := p.providers
 	enabledIDs := p.config.EnabledProviders
 
 	enabledSet := make(map[string]bool)
@@ -2329,35 +2268,43 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 				status, err = outcome.status, outcome.err
 			case <-time.After(25 * time.Second):
 				status = ProviderStatus{
-					ProviderID:  j.provider.ID(),
-					DisplayName: j.provider.DisplayName(),
-					AccountID:   j.auth.AccountID,
+					ProviderID:         j.provider.ID(),
+					DisplayName:        j.provider.DisplayName(),
+					AccountID:          j.auth.AccountID,
 					AccountDisplayName: j.auth.DisplayName,
-					Health:      "error",
-					Severity:    "info",
-					Details:     "Request timed out",
+					Health:             "error",
+					Severity:           "info",
+					Details:            "Request timed out",
 				}
 				err = fmt.Errorf("fetch timed out after 25s")
 			}
 
 			if err != nil {
 				sdk.Log("provider %s fetch error: %v", j.key, err)
+				health := "error"
+				if isRateLimitError(err) {
+					health = "rate_limited"
+				}
 				resultCh <- struct {
 					id  string
 					res fetchResult
 				}{j.key, fetchResult{
 					status: ProviderStatus{
-						ProviderID:  j.provider.ID(),
-						DisplayName: j.provider.DisplayName(),
-						AccountID:   j.auth.AccountID,
+						ProviderID:         j.provider.ID(),
+						DisplayName:        j.provider.DisplayName(),
+						AccountID:          j.auth.AccountID,
 						AccountDisplayName: j.auth.DisplayName,
-						Health:      "error",
-						Severity:    "info",
-						Details:     sanitizeDetail(err.Error()),
+						Health:             health,
+						Severity:           "info",
+						Details:            sanitizeDetail(err.Error()),
+						Timestamp:          time.Now().UTC(),
 					},
 					err: err,
 				}}
 				return
+			}
+			if status.Health == "ready" {
+				status.Severity = p.severityFor(status.UsagePercent)
 			}
 			sdk.Log("provider %s fetch done health=%s", j.key, status.Health)
 			resultCh <- struct {
@@ -2397,24 +2344,32 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 
 	// Build items (cards) for all fetched provider+account pairs
 	cards := make([]ProviderStatus, 0, len(results))
-	allAuthMissing := true
-	allErrored := true
-	hasAnyLive := false
-
+	var readyCount, authCount, rateLimitedCount, failedCount int
 	for _, res := range results {
-		if res.status.Health == "ready" {
-			allAuthMissing = false
-			allErrored = false
-			hasAnyLive = true
-			cards = append(cards, res.status)
-		} else if res.status.Health == "auth_required" {
-			allErrored = false
-			cards = append(cards, res.status)
-		} else {
-			cards = append(cards, res.status)
-			allAuthMissing = false
+		cards = append(cards, res.status)
+		switch res.status.Health {
+		case "ready":
+			readyCount++
+		case "auth_required":
+			authCount++
+		case "rate_limited":
+			rateLimitedCount++
+		default:
+			failedCount++
 		}
 	}
+	// Stable card order (map iteration is random): provider priority, then key.
+	sort.SliceStable(cards, func(i, j int) bool {
+		pi, pj := providerPriority[cards[i].ProviderID], providerPriority[cards[j].ProviderID]
+		if pi != pj {
+			return pi < pj
+		}
+		return cards[i].AccountID < cards[j].AccountID
+	})
+	hasAnyLive := readyCount > 0
+	allAuthMissing := authCount == len(results)
+	allRateLimited := readyCount == 0 && failedCount == 0 && rateLimitedCount > 0
+	allErrored := readyCount == 0 && !allAuthMissing && !allRateLimited
 
 	// Select menubar winner
 	winner := selectWinner(cards)
@@ -2435,6 +2390,15 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 		alerts = append(alerts, sdk.Alert{
 			ID: "ai-auth-required", Severity: sdk.SeverityWarning, Message: "AI provider credentials are missing. Set up auth in Settings.",
 		})
+	} else if allRateLimited {
+		summary = sdk.Summary{
+			Title: "AI Providers", Value: "AI rate limited", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "brain.head.profile",
+		}
+		health = sdk.HealthRateLimited
+		state = sdk.StateDegraded
+		alerts = append(alerts, sdk.Alert{
+			ID: "ai-rate-limited", Severity: sdk.SeverityWarning, Message: "AI provider usage APIs are rate limiting requests. Retrying later.",
+		})
 	} else if allErrored && len(jobs) > 0 {
 		summary = sdk.Summary{
 			Title: "AI Providers", Value: "AI unavailable", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "brain.head.profile",
@@ -2449,7 +2413,7 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 			Title:    effectiveDisplayName(winner.ProviderStatus),
 			Value:    winner.SummaryValue,
 			Trend:    sdk.TrendSteady,
-			Severity: winner.Severity,
+			Severity: validSeverity(winner.Severity),
 			IconHint: "brain.head.profile",
 		}
 		health = sdk.HealthOK
@@ -2511,6 +2475,13 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 	return snapshot
 }
 
+func itemTimestamp(t time.Time) string {
+	if t.IsZero() {
+		t = time.Now().UTC()
+	}
+	return t.Format(time.RFC3339)
+}
+
 type providerWithData struct {
 	ProviderStatus
 	HasData bool
@@ -2567,12 +2538,12 @@ func selectWinner(cards []ProviderStatus) providerWithData {
 }
 
 func cardToItem(p ProviderStatus) sdk.Item {
-	severity := p.Severity
-	if p.Health == "auth_required" {
-		severity = "info"
-	}
-	if p.Health == "error" {
-		severity = "warning"
+	severity := validSeverity(p.Severity)
+	switch p.Health {
+	case "auth_required":
+		severity = sdk.SeverityInfo
+	case "error", "rate_limited":
+		severity = sdk.SeverityWarning
 	}
 
 	var title string
@@ -2591,6 +2562,13 @@ func cardToItem(p ProviderStatus) sdk.Item {
 		title = displayTitle
 		subtitle = "Auth required"
 		detail = "Set up credentials in Settings"
+		if strings.TrimSpace(p.Details) != "" {
+			detail = sanitizeDetail(p.Details)
+		}
+	case "rate_limited":
+		title = displayTitle
+		subtitle = "Rate limited"
+		detail = sanitizeDetail(p.Details)
 	case "error":
 		title = displayTitle
 		subtitle = "Error"
@@ -2616,7 +2594,7 @@ func cardToItem(p ProviderStatus) sdk.Item {
 		Subtitle:  subtitle,
 		Detail:    detail,
 		Severity:  severity,
-		Timestamp: p.Timestamp.Format(time.RFC3339),
+		Timestamp: itemTimestamp(p.Timestamp),
 		DeepLink:  p.DeepLink,
 		Actions:   []sdk.Action{{ID: "open_" + p.ProviderID, Label: actionLabel}},
 		Metadata: map[string]string{
@@ -2635,6 +2613,7 @@ func cardToItem(p ProviderStatus) sdk.Item {
 func (p *aiProviderPlugin) Initialize(params sdk.InitializeParams) string {
 	p.config = parseConfig(params.Config)
 	p.providerAuth = make(map[string][]AuthContext)
+	claudeHomeDir = sdk.HostPathsFromConfig(params.Config).RealHome
 
 	// Process multi-provider auth (accumulate multiple accounts per provider)
 	for _, pa := range params.ProviderAuths {
@@ -2674,7 +2653,6 @@ func (p *aiProviderPlugin) Shutdown() {
 
 func main() {
 	pl := &aiProviderPlugin{
-		client:       &http.Client{Timeout: 12 * time.Second},
 		config:       defaultConfig(),
 		providerAuth: make(map[string][]AuthContext),
 		prevUsage:    make(map[string]float64),
