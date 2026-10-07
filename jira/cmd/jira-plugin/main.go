@@ -18,24 +18,40 @@ import (
 
 const (
 	pluginID      = "jira"
-	pluginVersion   = "0.1.2"
+	pluginVersion = "0.1.2"
 )
 
+// apiHTTPError carries only the status; response bodies are never surfaced
+// (they can be large HTML login pages or echo request details).
 type apiHTTPError struct {
 	StatusCode int
 	RetryAfter int
-	Body       string
 }
 
 func (e *apiHTTPError) Error() string {
-	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
+	return fmt.Sprintf("HTTP %d", e.StatusCode)
 }
+
+const maxBodyBytes = 4 << 20
+
+// searchFields are the issue fields requested for list/search views.
+var searchFields = []string{"summary", "status", "issuetype", "priority", "assignee", "duedate", "updated", "description"}
 
 // --- Jira API types ---
 
+// jiraSearchResponse is the /rest/api/3/search/jql shape. That endpoint does
+// not return "total"; more results are signalled by isLast/nextPageToken.
 type jiraSearchResponse struct {
-	Issues []jiraIssue `json:"issues"`
-	Total  int         `json:"total"`
+	Issues        []jiraIssue `json:"issues"`
+	IsLast        *bool       `json:"isLast"`
+	NextPageToken string      `json:"nextPageToken"`
+}
+
+func (r jiraSearchResponse) hasMore() bool {
+	if r.IsLast != nil {
+		return !*r.IsLast
+	}
+	return r.NextPageToken != ""
 }
 
 type jiraIssue struct {
@@ -123,15 +139,18 @@ type jiraHandler struct {
 	domain        string
 	cookieHeader  string
 	prevIssueKeys map[string]string
+	prevOverdue   int
+	seeded        bool // true once a successful snapshot populated prevIssueKeys
 }
 
 func (p *jiraHandler) Initialize(params sdk.InitializeParams) string {
 	p.config = parseConfig(params.Config)
 	p.domain = normalizeDomain(p.config.Domain)
 
+	// The host fills cookieHeader for both browser_import and web_session records.
 	for _, pa := range params.ProviderAuths {
-		if pa.Kind == "browser_import" && pa.CookieHeader != "" {
-			p.cookieHeader = pa.CookieHeader
+		if c := strings.TrimSpace(pa.CookieHeader); c != "" {
+			p.cookieHeader = c
 			break
 		}
 	}
@@ -173,12 +192,12 @@ func (p *jiraHandler) GetStatus() sdk.Snapshot {
 		}
 	}
 
-	issues, err := p.fetchIssues()
+	issues, hasMore, err := p.fetchIssues()
 	if err != nil {
 		sdk.Log("fetchIssues error: %v", err)
 		if apiErr, ok := err.(*apiHTTPError); ok {
 			health := httphealth.ClassifyHTTPStatus(apiErr.StatusCode)
-			msg := "Could not reach Jira: " + apiErr.Error()
+			msg := "Jira API error (" + apiErr.Error() + ")"
 			if health == httphealth.HealthAuthReq {
 				msg = "Jira session expired — re-import your browser session in Settings"
 			} else if health == httphealth.HealthRateLimited {
@@ -201,7 +220,7 @@ func (p *jiraHandler) GetStatus() sdk.Snapshot {
 			Summary:      sdk.Summary{Title: "Jira", Value: "Err", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "jira"},
 			Items:        []sdk.Item{},
 			Actions:      []sdk.Action{},
-			Alerts:       []sdk.Alert{{ID: "jira-fetch", Severity: sdk.SeverityWarning, Message: "Could not reach Jira: " + err.Error()}},
+			Alerts:       []sdk.Alert{{ID: "jira-fetch", Severity: sdk.SeverityWarning, Message: "Could not reach Jira"}},
 			RefreshAfter: 120,
 			Health:       sdk.HealthDegraded,
 		}
@@ -209,7 +228,7 @@ func (p *jiraHandler) GetStatus() sdk.Snapshot {
 
 	items := p.buildItems(issues)
 	alerts := p.buildAlerts(issues)
-	summary := p.buildSummary(items, len(issues))
+	summary := p.buildSummary(items, hasMore)
 
 	p.emitDeltas(issues)
 
@@ -228,11 +247,34 @@ func (p *jiraHandler) GetStatus() sdk.Snapshot {
 func (p *jiraHandler) emitDeltas(issues []jiraIssue) {
 	prevKeys := p.prevIssueKeys
 	currentKeys := make(map[string]string)
+	overdue := 0
 	for _, issue := range issues {
 		currentKeys[issue.Key] = issue.Fields.Status.Name
+		if isOverdue(issue, time.Now()) {
+			overdue++
+		}
+	}
+
+	if !p.seeded {
+		p.prevIssueKeys = currentKeys
+		p.prevOverdue = overdue
+		p.seeded = true
+		return
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+
+	if overdue > p.prevOverdue {
+		sdk.Emit(sdk.Event{
+			Type:      "issue.overdue",
+			PluginID:  pluginID,
+			Message:   fmt.Sprintf("%d overdue issue(s) need attention", overdue),
+			Severity:  sdk.SeverityWarning,
+			Data:      map[string]string{"count": strconv.Itoa(overdue)},
+			Timestamp: now,
+		})
+	}
+	p.prevOverdue = overdue
 
 	for key, oldStatus := range prevKeys {
 		newStatus, ok := currentKeys[key]
@@ -262,7 +304,7 @@ func (p *jiraHandler) emitDeltas(issues []jiraIssue) {
 	}
 
 	for key := range currentKeys {
-		if _, ok := prevKeys[key]; !ok && len(prevKeys) > 0 {
+		if _, ok := prevKeys[key]; !ok {
 			sdk.Log("new issue key=%s", key)
 			sdk.Emit(sdk.Event{
 				Type:      "issue.created",
@@ -307,32 +349,16 @@ func (p *jiraHandler) PerformAction(id string, params map[string]string) (bool, 
 func (p *jiraHandler) Shutdown() {}
 
 func (p *jiraHandler) getIssueDetails(key string) (bool, string) {
-	apiURL := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=summary,status,issuetype,priority,assignee,reporter,duedate,created,updated,labels,description,comment", p.domain, key)
+	apiURL := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=summary,status,issuetype,priority,assignee,reporter,duedate,created,updated,labels,description,comment", p.domain, url.PathEscape(key))
 
-	req, err := http.NewRequest("GET", apiURL, nil)
+	body, err := p.doJSON("GET", apiURL, nil)
 	if err != nil {
-		return false, err.Error()
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Cookie", p.cookieHeader)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return false, err.Error()
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, err.Error()
-	}
-	if resp.StatusCode != 200 {
-		return false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))
+		return false, userFacingError(err)
 	}
 
 	var issue jiraIssue
 	if err := json.Unmarshal(body, &issue); err != nil {
-		return false, err.Error()
+		return false, "could not decode Jira response"
 	}
 
 	description := strings.TrimSpace(extractADFText(issue.Fields.Description))
@@ -382,10 +408,69 @@ func (p *jiraHandler) getIssueDetails(key string) (bool, string) {
 	return true, strings.Join(lines, "\n")
 }
 
-func (p *jiraHandler) searchIssues(jql string) (bool, string) {
-	issues, err := p.fetchIssuesWithJQL(jql)
+// doJSON performs an authenticated Jira REST call using the imported browser
+// session and returns the body of a 2xx JSON response.
+func (p *jiraHandler) doJSON(method, apiURL string, payload []byte) ([]byte, error) {
+	var reqBody io.Reader
+	if payload != nil {
+		reqBody = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequest(method, apiURL, reqBody)
 	if err != nil {
-		return false, err.Error()
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Cookie", p.cookieHeader)
+	// Cookie-authenticated writes (including POST search) must opt out of
+	// Jira's XSRF check, otherwise Jira answers 403.
+	req.Header.Set("X-Atlassian-Token", "no-check")
+	req.Header.Set("User-Agent", "smuler-jira-plugin/"+pluginVersion)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("api request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &apiHTTPError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After")),
+		}
+	}
+	// An expired session is often redirected to the HTML login page (200).
+	if ct := strings.ToLower(resp.Header.Get("Content-Type")); strings.Contains(ct, "text/html") {
+		return nil, &apiHTTPError{StatusCode: http.StatusUnauthorized}
+	}
+	return body, nil
+}
+
+func userFacingError(err error) string {
+	if apiErr, ok := err.(*apiHTTPError); ok {
+		switch httphealth.ClassifyHTTPStatus(apiErr.StatusCode) {
+		case httphealth.HealthAuthReq:
+			return "Jira session expired — re-import your browser session in Settings"
+		case httphealth.HealthRateLimited:
+			return "Jira API rate limited"
+		}
+		return "Jira API error (" + apiErr.Error() + ")"
+	}
+	return "Could not reach Jira"
+}
+
+func (p *jiraHandler) searchIssues(jql string) (bool, string) {
+	issues, _, err := p.fetchIssuesWithJQL(jql)
+	if err != nil {
+		return false, userFacingError(err)
 	}
 
 	if len(issues) == 0 {
@@ -406,7 +491,7 @@ func (p *jiraHandler) searchIssues(jql string) (bool, string) {
 	return true, strings.Join(lines, "\n")
 }
 
-func (p *jiraHandler) fetchIssuesWithJQL(jql string) ([]jiraIssue, error) {
+func (p *jiraHandler) fetchIssuesWithJQL(jql string) ([]jiraIssue, bool, error) {
 	apiURL := fmt.Sprintf("%s/rest/api/3/search/jql", p.domain)
 
 	reqBody := struct {
@@ -416,109 +501,84 @@ func (p *jiraHandler) fetchIssuesWithJQL(jql string) ([]jiraIssue, error) {
 	}{
 		JQL:        jql,
 		MaxResults: p.config.MaxIssues,
-		Fields:     []string{"summary", "status", "issuetype", "priority", "assignee", "reporter", "duedate", "created", "updated", "labels", "description"},
+		Fields:     searchFields,
 	}
 	bodyJSON, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, err
+		return nil, false, fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(bodyJSON))
+	body, err := p.doJSON("POST", apiURL, bodyJSON)
 	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Cookie", p.cookieHeader)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, false, err
 	}
 
 	var result jiraSearchResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
+		return nil, false, fmt.Errorf("decode response: %w", err)
 	}
-	return result.Issues, nil
+	return result.Issues, result.hasMore(), nil
 }
 
 func humanDate(iso string) string {
-	t, err := time.Parse(time.RFC3339, iso)
-	if err != nil {
+	t, ok := parseJiraTime(iso)
+	if !ok {
 		return iso
 	}
 	return t.Format("Jan 2")
 }
 
-func (p *jiraHandler) fetchIssues() ([]jiraIssue, error) {
-	jql := p.buildJQL()
-	apiURL := fmt.Sprintf("%s/rest/api/3/search/jql", p.domain)
-
-	sdk.Log("fetching url=%s jql=%s max=%d", apiURL, jql, p.config.MaxIssues)
-
-	reqBody := struct {
-		JQL        string   `json:"jql"`
-		MaxResults int      `json:"maxResults"`
-		Fields     []string `json:"fields"`
-	}{
-		JQL:        jql,
-		MaxResults: p.config.MaxIssues,
-		Fields:     []string{"summary", "status", "issuetype", "priority", "assignee", "reporter", "duedate", "created", "updated", "labels", "description"},
-	}
-	bodyJSON, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(bodyJSON))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Cookie", p.cookieHeader)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("api request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode != 200 {
-		return nil, &apiHTTPError{
-			StatusCode: resp.StatusCode,
-			RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After")),
-			Body:       string(body),
+// parseJiraTime accepts Jira's "2006-01-02T15:04:05.000-0700" as well as RFC3339.
+func parseJiraTime(raw string) (time.Time, bool) {
+	for _, layout := range []string{"2006-01-02T15:04:05.000-0700", "2006-01-02T15:04:05-0700", time.RFC3339Nano} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t, true
 		}
 	}
+	return time.Time{}, false
+}
 
-	var result jiraSearchResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+// isoTimestamp converts a Jira timestamp to RFC3339 UTC, the format the host parses.
+func isoTimestamp(raw string) string {
+	t, ok := parseJiraTime(raw)
+	if !ok {
+		return ""
 	}
+	return t.UTC().Format(time.RFC3339)
+}
 
-	sdk.Log("got total=%d issues=%d", result.Total, len(result.Issues))
-	return result.Issues, nil
+// isOverdue reports whether the due date is before today (local time). A due
+// date of today is not yet overdue.
+func isOverdue(issue jiraIssue, now time.Time) bool {
+	if issue.Fields.DueDate == nil {
+		return false
+	}
+	due, err := time.ParseInLocation("2006-01-02", *issue.Fields.DueDate, now.Location())
+	if err != nil {
+		return false
+	}
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	return due.Before(today)
+}
+
+func (p *jiraHandler) fetchIssues() ([]jiraIssue, bool, error) {
+	jql := p.buildJQL()
+	sdk.Log("fetching domain=%s jql=%s max=%d", p.domain, jql, p.config.MaxIssues)
+
+	issues, hasMore, err := p.fetchIssuesWithJQL(jql)
+	if err != nil {
+		return nil, false, err
+	}
+	sdk.Log("got issues=%d more=%t", len(issues), hasMore)
+	return issues, hasMore, nil
 }
 
 func (p *jiraHandler) buildJQL() string {
 	if strings.TrimSpace(p.config.JQL) != "" {
 		jql := strings.TrimSpace(p.config.JQL)
+		if strings.Contains(strings.ToLower(jql), "order by") {
+			return jql
+		}
 		return fmt.Sprintf("%s ORDER BY updated DESC", jql)
 	}
 
@@ -572,12 +632,9 @@ func (p *jiraHandler) buildItems(issues []jiraIssue) []sdk.Item {
 			severity = sdk.SeverityWarning
 		}
 
-		if issue.Fields.DueDate != nil {
-			due, err := time.Parse("2006-01-02", *issue.Fields.DueDate)
-			if err == nil && due.Before(time.Now()) {
-				severity = sdk.SeverityCritical
-				detail = fmt.Sprintf("OVERDUE | %s", detail)
-			}
+		if isOverdue(issue, time.Now()) {
+			severity = sdk.SeverityCritical
+			detail = fmt.Sprintf("OVERDUE | %s", detail)
 		}
 
 		deepLink := fmt.Sprintf("%s/browse/%s", p.domain, issue.Key)
@@ -588,7 +645,7 @@ func (p *jiraHandler) buildItems(issues []jiraIssue) []sdk.Item {
 			Subtitle:  subtitle,
 			Detail:    detail,
 			Severity:  severity,
-			Timestamp: issue.Fields.Updated,
+			Timestamp: isoTimestamp(issue.Fields.Updated),
 			DeepLink:  deepLink,
 			Actions:   []sdk.Action{},
 		})
@@ -616,11 +673,8 @@ func (p *jiraHandler) buildAlerts(issues []jiraIssue) []sdk.Alert {
 
 	overdueCount := 0
 	for _, issue := range issues {
-		if issue.Fields.DueDate != nil {
-			due, err := time.Parse("2006-01-02", *issue.Fields.DueDate)
-			if err == nil && due.Before(time.Now()) {
-				overdueCount++
-			}
+		if isOverdue(issue, time.Now()) {
+			overdueCount++
 		}
 	}
 
@@ -635,8 +689,8 @@ func (p *jiraHandler) buildAlerts(issues []jiraIssue) []sdk.Alert {
 	return alerts
 }
 
-func (p *jiraHandler) buildSummary(items []sdk.Item, total int) sdk.Summary {
-	if total == 0 {
+func (p *jiraHandler) buildSummary(items []sdk.Item, hasMore bool) sdk.Summary {
+	if len(items) == 0 {
 		return sdk.Summary{
 			Title:    "Jira",
 			Value:    "0 issues",
@@ -658,8 +712,8 @@ func (p *jiraHandler) buildSummary(items []sdk.Item, total int) sdk.Summary {
 		}
 	}
 
-	if total > p.config.MaxIssues {
-		value = fmt.Sprintf("%d+", p.config.MaxIssues)
+	if hasMore {
+		value = fmt.Sprintf("%d+", len(items))
 	}
 
 	return sdk.Summary{
