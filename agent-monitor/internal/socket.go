@@ -3,26 +3,35 @@ package internal
 import (
 	"bufio"
 	"encoding/json"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/lum1n/smuler/plugins/sdk-go"
 )
+
+// maxSocketLine bounds a single hook event; bufio.Scanner's 64KB default
+// silently dropped events carrying a large outputTail.
+const maxSocketLine = 1024 * 1024
+
+// socketConnTimeout bounds how long a hook client may keep a connection open.
+const socketConnTimeout = 10 * time.Second
 
 // SocketEvent is emitted by shell hooks or agent native hooks.
 type SocketEvent struct {
-	Type       string `json:"type"`
-	AgentID    string `json:"agentId"`
-	AgentName  string `json:"agentName"`
-	Command    string `json:"command"`
-	PID        int    `json:"pid"`
-	ExitCode   *int   `json:"exitCode,omitempty"`
-	Message    string `json:"message,omitempty"`
-	OutputTail string `json:"outputTail,omitempty"`
-	State      string `json:"state,omitempty"`
-	Label      string `json:"label,omitempty"`
+	Type         string `json:"type"`
+	AgentID      string `json:"agentId"`
+	AgentName    string `json:"agentName"`
+	Command      string `json:"command"`
+	PID          int    `json:"pid"`
+	ExitCode     *int   `json:"exitCode,omitempty"`
+	Message      string `json:"message,omitempty"`
+	OutputTail   string `json:"outputTail,omitempty"`
+	State        string `json:"state,omitempty"`
+	Label        string `json:"label,omitempty"`
 	SessionID    string `json:"sessionId,omitempty"`
 	Tool         string `json:"tool,omitempty"`
 	QuestionText string `json:"questionText,omitempty"`
@@ -34,6 +43,8 @@ type SocketListener struct {
 	store *AgentStore
 	ln    net.Listener
 	done  chan struct{}
+
+	stopOnce sync.Once
 }
 
 // NewSocketListener creates a socket listener at the given path.
@@ -62,12 +73,14 @@ func (sl *SocketListener) Start() error {
 	return nil
 }
 
-// Stop closes the listener.
+// Stop closes the listener. Safe to call more than once.
 func (sl *SocketListener) Stop() {
-	if sl.ln != nil {
-		sl.ln.Close()
-	}
-	close(sl.done)
+	sl.stopOnce.Do(func() {
+		close(sl.done)
+		if sl.ln != nil {
+			sl.ln.Close()
+		}
+	})
 }
 
 func (sl *SocketListener) acceptLoop() {
@@ -78,6 +91,8 @@ func (sl *SocketListener) acceptLoop() {
 			case <-sl.done:
 				return
 			default:
+				// Avoid a hot loop on persistent accept errors.
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 		}
@@ -87,7 +102,9 @@ func (sl *SocketListener) acceptLoop() {
 
 func (sl *SocketListener) handleConn(conn net.Conn) {
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(socketConnTimeout))
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxSocketLine)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -102,6 +119,9 @@ func (sl *SocketListener) handleConn(conn net.Conn) {
 }
 
 func (sl *SocketListener) process(ev SocketEvent) {
+	if ev.AgentID == "" {
+		return
+	}
 	id := sl.store.ResolveHookID(ev.AgentID, ev.PID)
 	existing := sl.store.Get(id)
 	switch ev.Type {
@@ -131,11 +151,14 @@ func (sl *SocketListener) process(ev SocketEvent) {
 		if ev.ExitCode != nil && *ev.ExitCode != 0 {
 			state = "error"
 		}
-		if existing != nil {
-			sl.store.AddHistory(existing.AgentID, existing.Command, state, existing.Task, time.Now().UnixMilli())
+		if existing == nil {
+			// The session was re-keyed to the agent's own PID or already
+			// removed; creating a new entry here left a nameless ghost row.
+			return
 		}
+		sl.store.AddHistory(existing.AgentID, existing.Command, state, existing.Task, time.Now().UnixMilli())
 		source := SourceProc
-		if existing != nil && existing.Source == SourceTmux {
+		if existing.Source == SourceTmux {
 			source = SourceTmux
 		}
 		sl.store.Upsert(AgentSession{
@@ -145,7 +168,7 @@ func (sl *SocketListener) process(ev SocketEvent) {
 			ExitCode: ev.ExitCode,
 			Source:   source,
 		})
-		log.Printf("[agent-monitor] agent %s ended with state=%s exitCode=%v", ev.AgentID, state, ev.ExitCode)
+		sdk.Log("agent %s ended with state=%s", ev.AgentID, state)
 
 	case "agent_question":
 		state := "question"
@@ -164,7 +187,7 @@ func (sl *SocketListener) process(ev SocketEvent) {
 			PID:          ev.PID,
 			Source:       source,
 		})
-		log.Printf("[agent-monitor] agent %s needs attention: %s", ev.AgentID, ev.Message)
+		sdk.Log("agent %s needs attention", ev.AgentID)
 
 	case "agent_status":
 		state := ev.State
@@ -189,6 +212,6 @@ func (sl *SocketListener) process(ev SocketEvent) {
 			PID:          ev.PID,
 			Source:       source,
 		})
-		log.Printf("[agent-monitor] agent %s status: %s (label: %s)", ev.AgentID, state, ev.Label)
+		sdk.Log("agent %s status: %s", ev.AgentID, state)
 	}
 }

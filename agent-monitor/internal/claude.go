@@ -1,16 +1,35 @@
 package internal
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+// maxInitialTranscriptRead bounds the first parse of a very large transcript
+// to its tail; later refreshes only read newly appended bytes.
+const maxInitialTranscriptRead = 16 * 1024 * 1024
+
+// transcriptCacheTTL evicts cached transcript state that has not been used.
+const transcriptCacheTTL = 10 * time.Minute
 
 // ClaudeContextReader reads Claude Code session metadata and transcripts.
 type ClaudeContextReader struct {
 	baseDir string
+
+	mu          sync.Mutex
+	transcripts map[string]string // sessionID -> transcript path
+	states      map[string]*claudeTranscriptCache
+}
+
+type claudeTranscriptCache struct {
+	tail     jsonlTail
+	state    claudeTranscriptState
+	lastUsed time.Time
 }
 
 type claudeSessionMeta struct {
@@ -22,7 +41,16 @@ type claudeSessionMeta struct {
 // NewClaudeContextReader creates a reader for Claude Code's local files.
 func NewClaudeContextReader() *ClaudeContextReader {
 	home, _ := os.UserHomeDir()
-	return &ClaudeContextReader{baseDir: filepath.Join(home, ".claude")}
+	return NewClaudeContextReaderAt(filepath.Join(home, ".claude"))
+}
+
+// NewClaudeContextReaderAt creates a reader rooted at an explicit ~/.claude dir.
+func NewClaudeContextReaderAt(baseDir string) *ClaudeContextReader {
+	return &ClaudeContextReader{
+		baseDir:     baseDir,
+		transcripts: make(map[string]string),
+		states:      make(map[string]*claudeTranscriptCache),
+	}
 }
 
 // ContextForPID returns Claude Code session context for the given process.
@@ -49,12 +77,12 @@ func (r *ClaudeContextReader) ContextForPID(pid int) AgentSession {
 		return ctx
 	}
 
-	transcript := r.findTranscript(meta.SessionID)
+	transcript := r.findTranscript(meta.SessionID, meta.CWD)
 	if transcript == "" {
 		return ctx
 	}
 
-	state := readClaudeTranscriptState(transcript)
+	state := r.transcriptState(transcript)
 	ctx.Task = state.lastPrompt
 	ctx.CurrentTool = state.currentTool
 	ctx.CurrentFile = state.currentFile
@@ -76,6 +104,14 @@ func (r *ClaudeContextReader) ContextForPID(pid int) AgentSession {
 
 func (r *ClaudeContextReader) sessionMetaForPID(pid int) (claudeSessionMeta, bool) {
 	sessionsDir := filepath.Join(r.baseDir, "sessions")
+	// Claude Code names session files after the process id; try that first
+	// before scanning the whole directory.
+	if data, err := os.ReadFile(filepath.Join(sessionsDir, strconv.Itoa(pid)+".json")); err == nil {
+		var meta claudeSessionMeta
+		if json.Unmarshal(data, &meta) == nil && meta.PID == pid {
+			return meta, true
+		}
+	}
 	entries, err := os.ReadDir(sessionsDir)
 	if err != nil {
 		return claudeSessionMeta{}, false
@@ -97,63 +133,113 @@ func (r *ClaudeContextReader) sessionMetaForPID(pid int) (claudeSessionMeta, boo
 	return claudeSessionMeta{}, false
 }
 
-func (r *ClaudeContextReader) findTranscript(sessionID string) string {
+// findTranscript locates <sessionID>.jsonl under ~/.claude/projects. It checks
+// the directory derived from cwd first and otherwise only looks one level deep
+// (projects/<dir>/<id>.jsonl) instead of walking the whole tree; hits are cached.
+func (r *ClaudeContextReader) findTranscript(sessionID, cwd string) string {
+	if sessionID == "" || strings.ContainsAny(sessionID, `/\`) {
+		return ""
+	}
+	name := sessionID + ".jsonl"
+
+	r.mu.Lock()
+	cached := r.transcripts[sessionID]
+	r.mu.Unlock()
+	if cached != "" {
+		if _, err := os.Stat(cached); err == nil {
+			return cached
+		}
+	}
+
 	projectsDir := filepath.Join(r.baseDir, "projects")
-	var found string
-	_ = filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d == nil || d.IsDir() {
-			return nil
+	found := ""
+	if cwd != "" {
+		candidate := filepath.Join(projectsDir, claudeProjectDirName(cwd), name)
+		if _, err := os.Stat(candidate); err == nil {
+			found = candidate
 		}
-		if filepath.Base(path) == sessionID+".jsonl" {
-			found = path
-			return filepath.SkipAll
+	}
+	if found == "" {
+		entries, err := os.ReadDir(projectsDir)
+		if err != nil {
+			return ""
 		}
-		return nil
-	})
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			candidate := filepath.Join(projectsDir, e.Name(), name)
+			if _, err := os.Stat(candidate); err == nil {
+				found = candidate
+				break
+			}
+		}
+	}
+	if found != "" {
+		r.mu.Lock()
+		r.transcripts[sessionID] = found
+		r.mu.Unlock()
+	}
 	return found
 }
 
-type claudeTranscriptState struct {
-	lastPrompt       string
-	lastRole         string
-	lastAssistantText string
-	currentTool      string
-	currentFile      string
-	pendingToolUse   bool
-	model            string
-	provider         string
-	tokensInput      int64
-	tokensOutput     int64
-	cacheRead        int64
-	cacheWrite       int64
-	todos            []TodoItem
-}
-
-func readClaudeTranscriptState(path string) claudeTranscriptState {
-	file, err := os.Open(path)
-	if err != nil {
-		return claudeTranscriptState{}
-	}
-	defer file.Close()
-
-	state := claudeTranscriptState{}
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 2*1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+// claudeProjectDirName mirrors Claude Code's project directory naming, which
+// replaces every non-alphanumeric character of the cwd with '-'.
+func claudeProjectDirName(cwd string) string {
+	b := []byte(cwd)
+	for i, c := range b {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+			b[i] = '-'
 		}
-		updateClaudeStateFromLine(line, &state)
 	}
-	return state
+	return string(b)
 }
 
-func updateClaudeStateFromLine(line string, state *claudeTranscriptState) {
+// transcriptState returns the parsed state for a transcript, reading only the
+// bytes appended since the previous call.
+func (r *ClaudeContextReader) transcriptState(path string) claudeTranscriptState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	for p, c := range r.states {
+		if now.Sub(c.lastUsed) > transcriptCacheTTL {
+			delete(r.states, p)
+		}
+	}
+	c := r.states[path]
+	if c == nil {
+		c = &claudeTranscriptCache{tail: jsonlTail{maxInitial: maxInitialTranscriptRead}}
+		r.states[path] = c
+	}
+	c.lastUsed = now
+	_ = c.tail.next(path,
+		func() { c.state = claudeTranscriptState{} },
+		func(line []byte) { updateClaudeStateFromLine(line, &c.state) })
+	st := c.state
+	st.todos = append([]TodoItem(nil), c.state.todos...)
+	return st
+}
+
+type claudeTranscriptState struct {
+	lastPrompt        string
+	lastRole          string
+	lastAssistantText string
+	currentTool       string
+	currentFile       string
+	pendingToolUse    bool
+	model             string
+	provider          string
+	tokensInput       int64
+	tokensOutput      int64
+	cacheRead         int64
+	cacheWrite        int64
+	todos             []TodoItem
+}
+
+func updateClaudeStateFromLine(line []byte, state *claudeTranscriptState) {
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+	if err := json.Unmarshal(line, &raw); err != nil {
 		return
 	}
 
@@ -170,8 +256,11 @@ func updateClaudeStateFromLine(line string, state *claudeTranscriptState) {
 	if role == "user" || msgType == "user" {
 		state.lastRole = "user"
 		state.pendingToolUse = false
-		if prompt := extractClaudePrompt(msg); prompt != "" {
-			state.lastPrompt = prompt
+		// isMeta lines are synthetic (command caveats etc.), not user prompts.
+		if isMeta, _ := raw["isMeta"].(bool); !isMeta {
+			if prompt := extractClaudePrompt(msg); prompt != "" {
+				state.lastPrompt = prompt
+			}
 		}
 	}
 
@@ -208,6 +297,12 @@ func updateClaudeStateFromLine(line string, state *claudeTranscriptState) {
 					if fp, _ := input["file_path"].(string); fp != "" {
 						state.currentFile = fp
 					}
+					// TodoWrite carries the full todo list in its input.
+					if name, _ := block["name"].(string); name == "TodoWrite" {
+						if todosArr, ok := input["todos"].([]any); ok {
+							state.todos = parseClaudeTodos(todosArr)
+						}
+					}
 				}
 			}
 			if blockType == "text" {
@@ -226,14 +321,6 @@ func updateClaudeStateFromLine(line string, state *claudeTranscriptState) {
 		}
 	}
 
-	// TodoWrite tool results update todos.
-	if state.currentTool == "TodoWrite" {
-		if input, ok := msg["input"].(map[string]any); ok {
-			if todosArr, ok := input["todos"].([]any); ok {
-				state.todos = parseClaudeTodos(todosArr)
-			}
-		}
-	}
 }
 
 func extractClaudePrompt(raw map[string]any) string {
@@ -251,6 +338,11 @@ func extractClaudePrompt(raw map[string]any) string {
 				return s
 			}
 		}
+	}
+	// Transcript lines unwrap to {"role":"user","content":...}. Tool results
+	// also use the user role but carry no text blocks, so they yield "".
+	if role, _ := raw["role"].(string); role == "user" {
+		return extractStringField(raw, "content", "text")
 	}
 	return ""
 }

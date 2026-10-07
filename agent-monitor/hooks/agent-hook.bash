@@ -6,37 +6,39 @@ _agent_monitor_send() {
   fi
 }
 
-_agent_monitor_preexec() {
-  local cmd="$1"
-  local agent_id=""
-  case "$cmd" in
-    archer*)   agent_id="archer" ;;
-    claude*)   agent_id="claude" ;;
-    opencode*) agent_id="opencode" ;;
-    codex*)    agent_id="codex" ;;
-    pi*)       agent_id="pi" ;;
-    aider*)    agent_id="aider" ;;
+# Print the agent id for a command line, or nothing. Matches the command word
+# exactly so e.g. "ping" or "pip" are not mistaken for "pi".
+_agent_monitor_agent_for() {
+  case "$1" in
+    archer|archer\ *)     echo archer ;;
+    claude|claude\ *)     echo claude ;;
+    opencode|opencode\ *) echo opencode ;;
+    codex|codex\ *)       echo codex ;;
+    pi|pi\ *)             echo pi ;;
+    aider|aider\ *)       echo aider ;;
   esac
-  if [ -n "$agent_id" ]; then
-    _agent_monitor_send "{\"type\":\"agent_start\",\"agentId\":\"$agent_id\",\"agentName\":\"$agent_id\",\"command\":\"$cmd\",\"pid\":$$}"
-  fi
 }
 
 _agent_monitor_prompt_command() {
   local last_exit=$?
-  if [ -n "$_agent_monitor_last_cmd" ]; then
-    case "$_agent_monitor_last_cmd" in
-      archer*|claude*|opencode*|codex*|pi*|aider*)
-        local agent_id="${_agent_monitor_last_cmd%% *}"
-        agent_id="${agent_id%%/*}"
-        _agent_monitor_send "{\"type\":\"agent_end\",\"agentId\":\"$agent_id\",\"exitCode\":$last_exit,\"pid\":$$}"
-        ;;
-    esac
+  local hist
+  hist="$(history 1)"
+  # Only react to a new history entry; an empty Enter re-runs PROMPT_COMMAND
+  # with the same last command and used to emit duplicate agent_end events.
+  if [ "$hist" != "$_agent_monitor_last_hist" ]; then
+    _agent_monitor_last_hist="$hist"
+    local cmd agent_id
+    cmd="$(printf '%s' "$hist" | sed 's/^[ ]*[0-9]*[ ]*//')"
+    agent_id="$(_agent_monitor_agent_for "$cmd")"
+    if [ -n "$agent_id" ]; then
+      _agent_monitor_send "{\"type\":\"agent_end\",\"agentId\":\"$agent_id\",\"exitCode\":$last_exit,\"pid\":$$}"
+    fi
   fi
-  _agent_monitor_last_cmd="$(history 1 | sed 's/^[ ]*[0-9]*[ ]*//')"
+  return $last_exit
 }
 
-if [ -z "${PROMPT_COMMAND_orig-}" ]; then
-  PROMPT_COMMAND_orig="$PROMPT_COMMAND"
-fi
-PROMPT_COMMAND="_agent_monitor_prompt_command;${PROMPT_COMMAND:-}"
+_agent_monitor_last_hist="$(history 1)"
+case ";${PROMPT_COMMAND:-};" in
+  *";_agent_monitor_prompt_command;"*) ;;
+  *) PROMPT_COMMAND="_agent_monitor_prompt_command;${PROMPT_COMMAND:-}" ;;
+esac

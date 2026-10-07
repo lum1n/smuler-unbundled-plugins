@@ -3,11 +3,12 @@ package internal
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/lum1n/smuler/plugins/sdk-go"
 )
 
 // HookEventConfig describes one native hook event to register.
@@ -18,12 +19,12 @@ type HookEventConfig struct {
 
 // NativeHookConfig configures a native hook installer for a specific agent.
 type NativeHookConfig struct {
-	AgentID       string
-	AgentName     string
-	ScriptName    string
-	SettingsPath  string
-	BackupSuffix  string
-	Events        []HookEventConfig
+	AgentID         string
+	AgentName       string
+	ScriptName      string
+	SettingsPath    string
+	BackupSuffix    string
+	Events          []HookEventConfig
 	ExtraToolLabels map[string]string
 }
 
@@ -58,7 +59,7 @@ func (i *NativeHookInstaller) Install() error {
 
 	nodePath, err := exec.LookPath("node")
 	if err != nil {
-		log.Printf("[agent-monitor] node not found, skipping %s hook install: %v", i.cfg.AgentName, err)
+		sdk.Log("node not found, skipping %s hook install: %v", i.cfg.AgentName, err)
 		return nil
 	}
 
@@ -66,12 +67,12 @@ func (i *NativeHookInstaller) Install() error {
 	settings := i.loadSettings(settingsPath)
 
 	if i.isInstalled(settings, nodePath) {
-		log.Printf("[agent-monitor] %s hooks already installed in %s", i.cfg.AgentName, settingsPath)
+		sdk.Log("%s hooks already installed in %s", i.cfg.AgentName, settingsPath)
 		return nil
 	}
 
 	if err := i.backup(settingsPath); err != nil {
-		log.Printf("[agent-monitor] warning: failed to backup %s: %v", settingsPath, err)
+		sdk.Log("warning: failed to backup %s: %v", settingsPath, err)
 	}
 
 	i.apply(settings, nodePath)
@@ -85,7 +86,7 @@ func (i *NativeHookInstaller) Install() error {
 		return fmt.Errorf("write settings: %w", err)
 	}
 
-	log.Printf("[agent-monitor] installed %s native hooks in %s", i.cfg.AgentName, settingsPath)
+	sdk.Log("installed %s native hooks in %s", i.cfg.AgentName, settingsPath)
 	return nil
 }
 
@@ -144,7 +145,7 @@ func (i *NativeHookInstaller) Uninstall() {
 	out, _ := json.MarshalIndent(settings, "", "  ")
 	out = append(out, '\n')
 	os.WriteFile(settingsPath, out, 0600)
-	log.Printf("[agent-monitor] removed %s native hooks from %s", i.cfg.AgentName, settingsPath)
+	sdk.Log("removed %s native hooks from %s", i.cfg.AgentName, settingsPath)
 }
 
 func (i *NativeHookInstaller) loadSettings(path string) map[string]any {

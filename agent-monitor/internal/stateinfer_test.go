@@ -4,10 +4,10 @@ import "testing"
 
 func TestInferSessionState(t *testing.T) {
 	tests := []struct {
-		name     string
-		signals  SessionSignals
-		want     string
-		wantQ    string
+		name    string
+		signals SessionSignals
+		want    string
+		wantQ   string
 	}{
 		{
 			name:    "user prompt in flight",
@@ -25,9 +25,19 @@ func TestInferSessionState(t *testing.T) {
 			want:    "working",
 		},
 		{
-			name:    "current tool without user turn",
-			signals: SessionSignals{LastRole: "assistant", CurrentTool: "Bash"},
+			name:    "tool result is last entry",
+			signals: SessionSignals{LastRole: "toolResult", CurrentTool: "Bash"},
 			want:    "working",
+		},
+		{
+			name:    "assistant reply after earlier tool use is idle",
+			signals: SessionSignals{LastRole: "assistant", CurrentTool: "Bash", LastAssistantText: "All done."},
+			want:    "running",
+		},
+		{
+			name:    "question mark inside code is not a question",
+			signals: SessionSignals{LastRole: "assistant", LastAssistantText: "Use `a ? b : c` here.\nAll tests pass."},
+			want:    "running",
 		},
 		{
 			name:    "assistant question",
@@ -38,7 +48,7 @@ func TestInferSessionState(t *testing.T) {
 		{
 			name:    "assistant idle between turns",
 			signals: SessionSignals{LastRole: "assistant", LastAssistantText: "Done."},
-			want:    "thinking",
+			want:    "running",
 		},
 		{
 			name:    "no signals",
@@ -72,6 +82,12 @@ func TestMergeAgentState(t *testing.T) {
 	}
 	if got := MergeAgentState("question", "working"); got != "question" {
 		t.Fatalf("got %q, want question", got)
+	}
+	if got := MergeAgentState("completed", "running"); got != "completed" {
+		t.Fatalf("got %q, want completed", got)
+	}
+	if got := MergeAgentState("completed", "working"); got != "working" {
+		t.Fatalf("got %q, want working", got)
 	}
 }
 

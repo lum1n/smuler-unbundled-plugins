@@ -123,3 +123,19 @@ func indexOf(s, substr string) int {
 	}
 	return -1
 }
+
+func TestAnalyzeReturnsOnlyRequestedRepo(t *testing.T) {
+	a := NewAnalyzer()
+	a.storePath = filepath.Join(t.TempDir(), "suggestions.json")
+
+	a.Analyze("repo-a", []string{"Use spaces."}, []Session{{ID: "s1", Task: "Switch to tabs."}})
+	got := a.Analyze("repo-b", []string{"Use spaces."}, []Session{{ID: "s2", Task: "Switch to tabs."}})
+	if len(got) == 0 {
+		t.Fatal("expected suggestions for repo-b")
+	}
+	for _, s := range got {
+		if s.Repo != "repo-b" {
+			t.Fatalf("got suggestion for %s when analyzing repo-b", s.Repo)
+		}
+	}
+}

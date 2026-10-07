@@ -57,3 +57,21 @@ func TestProcDetectorRekeysShellHookSession(t *testing.T) {
 		t.Fatalf("pid = %d, want 4242", got.PID)
 	}
 }
+
+func TestRemoveOrphansKeepsWatcherSessions(t *testing.T) {
+	store := NewAgentStore()
+	pd := NewProcDetector(store, time.Hour)
+	stale := time.Now().Add(-2 * orphanGrace).UnixMilli()
+
+	store.Upsert(AgentSession{ID: "tmux-pane", AgentID: "claude", State: "working", Source: SourceTmux, UpdatedAt: stale})
+	store.Upsert(AgentSession{ID: "hook-ghost", AgentID: "claude", State: "working", Source: SourceProc, UpdatedAt: stale})
+
+	pd.removeOrphans(map[string]bool{})
+
+	if store.Get("tmux-pane") == nil {
+		t.Fatal("watcher-owned tmux session was pruned")
+	}
+	if store.Get("hook-ghost") != nil {
+		t.Fatal("orphaned hook session without a PID was kept")
+	}
+}

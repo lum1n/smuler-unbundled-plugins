@@ -7,37 +7,45 @@ _agent_monitor_send() {
   fi
 }
 
-_agent_monitor_known_agents="archer|claude|opencode|codex|pi|aider"
+# Escape a string for embedding in a JSON string literal.
+_agent_monitor_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/ }"
+  s="${s//$'\t'/ }"
+  print -r -- "$s"
+}
+
+# Print the agent id for a command line, or nothing. Matches the command word
+# exactly so e.g. "ping" or "pip" are not mistaken for "pi".
+_agent_monitor_agent_for() {
+  case "$1" in
+    archer|archer\ *)     print archer ;;
+    claude|claude\ *)     print claude ;;
+    opencode|opencode\ *) print opencode ;;
+    codex|codex\ *)       print codex ;;
+    pi|pi\ *)             print pi ;;
+    aider|aider\ *)       print aider ;;
+  esac
+}
 
 _agent_monitor_preexec() {
   local cmd="$1"
-  local agent_id=""
-  case "$cmd" in
-    archer*)   agent_id="archer" ;;
-    claude*)   agent_id="claude" ;;
-    opencode*) agent_id="opencode" ;;
-    codex*)    agent_id="codex" ;;
-    pi*)       agent_id="pi" ;;
-    aider*)    agent_id="aider" ;;
-  esac
+  local agent_id="$(_agent_monitor_agent_for "$cmd")"
+  _agent_monitor_last_agent="$agent_id"
   if [ -n "$agent_id" ]; then
-    _agent_monitor_send "{\"type\":\"agent_start\",\"agentId\":\"$agent_id\",\"agentName\":\"$agent_id\",\"command\":\"$cmd\",\"pid\":$$}"
+    local esc="$(_agent_monitor_json_escape "$cmd")"
+    _agent_monitor_send "{\"type\":\"agent_start\",\"agentId\":\"$agent_id\",\"agentName\":\"$agent_id\",\"command\":\"$esc\",\"pid\":$$}"
   fi
 }
 
 _agent_monitor_precmd() {
   local last_exit=$?
-  local last_cmd=""
-  if [ -n "$_agent_monitor_last_cmd" ]; then
-    case "$_agent_monitor_last_cmd" in
-      archer*|claude*|opencode*|codex*|pi*|aider*)
-        local agent_id="${_agent_monitor_last_cmd%% *}"
-        agent_id="${agent_id%%/*}"
-        _agent_monitor_send "{\"type\":\"agent_end\",\"agentId\":\"$agent_id\",\"exitCode\":$last_exit,\"pid\":$$}"
-        ;;
-    esac
+  if [ -n "$_agent_monitor_last_agent" ]; then
+    _agent_monitor_send "{\"type\":\"agent_end\",\"agentId\":\"$_agent_monitor_last_agent\",\"exitCode\":$last_exit,\"pid\":$$}"
   fi
-  _agent_monitor_last_cmd="$1"
+  _agent_monitor_last_agent=""
 }
 
 autoload -Uz add-zsh-hook

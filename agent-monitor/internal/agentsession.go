@@ -18,44 +18,44 @@ type TodoItem struct {
 // finished agent. It is produced by combining process detection, shell/native
 // hook events, and agent-specific context readers.
 type AgentSession struct {
-	ID           string `json:"id"`
-	AgentID      string `json:"agentId"`      // claude, codex, opencode, pi, aider, archer, ...
-	DisplayName  string `json:"displayName"`  // "Claude Code", "Codex", "Pi", ...
-	PID          int    `json:"pid"`
-	Command      string `json:"command"`      // raw command line
-	Task         string `json:"task"`         // current task / last user prompt
-	State        string `json:"state"`        // running | working | thinking | question | completed | error | paused
-	OutputTail   string `json:"outputTail"`
-	SessionID    string `json:"sessionId"`    // agent-native session id when known
-	CurrentFile  string `json:"currentFile"`  // file currently being read/written
-	CurrentTool  string `json:"currentTool"`  // current tool name
-	Model        string `json:"model"`
-	Provider     string `json:"provider"`
-	Cost         float64 `json:"cost"`
-	TokensInput  int64   `json:"tokensInput"`
-	TokensOutput int64   `json:"tokensOutput"`
-	CacheRead    int64   `json:"cacheRead"`
-	CacheWrite   int64   `json:"cacheWrite"`
-	FilesChanged int     `json:"filesChanged"`
-	Additions    int     `json:"additions"`
-	Deletions    int     `json:"deletions"`
-	CWD          string `json:"cwd"`
-	RepoRoot     string `json:"repoRoot"`
-	RepoName     string `json:"repoName"`
-	RepoFullName string `json:"repoFullName"`
-	Branch       string `json:"branch"`
-	IsRepoDirty  bool   `json:"isRepoDirty"`
-	QuestionText string `json:"questionText,omitempty"`
+	ID           string     `json:"id"`
+	AgentID      string     `json:"agentId"`     // claude, codex, opencode, pi, aider, archer, ...
+	DisplayName  string     `json:"displayName"` // "Claude Code", "Codex", "Pi", ...
+	PID          int        `json:"pid"`
+	Command      string     `json:"command"` // raw command line
+	Task         string     `json:"task"`    // current task / last user prompt
+	State        string     `json:"state"`   // running | working | thinking | question | completed | error | paused
+	OutputTail   string     `json:"outputTail"`
+	SessionID    string     `json:"sessionId"`   // agent-native session id when known
+	CurrentFile  string     `json:"currentFile"` // file currently being read/written
+	CurrentTool  string     `json:"currentTool"` // current tool name
+	Model        string     `json:"model"`
+	Provider     string     `json:"provider"`
+	Cost         float64    `json:"cost"`
+	TokensInput  int64      `json:"tokensInput"`
+	TokensOutput int64      `json:"tokensOutput"`
+	CacheRead    int64      `json:"cacheRead"`
+	CacheWrite   int64      `json:"cacheWrite"`
+	FilesChanged int        `json:"filesChanged"`
+	Additions    int        `json:"additions"`
+	Deletions    int        `json:"deletions"`
+	CWD          string     `json:"cwd"`
+	RepoRoot     string     `json:"repoRoot"`
+	RepoName     string     `json:"repoName"`
+	RepoFullName string     `json:"repoFullName"`
+	Branch       string     `json:"branch"`
+	IsRepoDirty  bool       `json:"isRepoDirty"`
+	QuestionText string     `json:"questionText,omitempty"`
 	Todos        []TodoItem `json:"todos"`
-	StartTime    int64  `json:"startTime"`    // ms since epoch
-	UpdatedAt    int64  `json:"updatedAt"`    // ms since epoch
-	ExitCode     *int   `json:"exitCode,omitempty"`
-	Available    bool   `json:"available"`    // true when context reader found data
-	Source       string `json:"source,omitempty"` // tmux | proc
-	TmuxSession  string `json:"tmuxSession,omitempty"`
-	TmuxWindow   int    `json:"tmuxWindow,omitempty"`
-	WatcherPath  string `json:"watcherPath,omitempty"`
-	Unbound      bool   `json:"unbound,omitempty"`
+	StartTime    int64      `json:"startTime"` // ms since epoch
+	UpdatedAt    int64      `json:"updatedAt"` // ms since epoch
+	ExitCode     *int       `json:"exitCode,omitempty"`
+	Available    bool       `json:"available"`        // true when context reader found data
+	Source       string     `json:"source,omitempty"` // tmux | proc
+	TmuxSession  string     `json:"tmuxSession,omitempty"`
+	TmuxWindow   int        `json:"tmuxWindow,omitempty"`
+	WatcherPath  string     `json:"watcherPath,omitempty"`
+	Unbound      bool       `json:"unbound,omitempty"`
 }
 
 // IsTerminalState returns true when the agent has finished.

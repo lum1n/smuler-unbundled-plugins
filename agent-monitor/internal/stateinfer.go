@@ -18,17 +18,19 @@ func InferSessionState(s SessionSignals) (state, questionText string) {
 	if s.ActiveToolExec || s.PendingToolUse {
 		return "working", ""
 	}
-	if s.CurrentTool != "" && s.LastRole != "user" {
+	// A tool result is the last entry: the model is about to continue. An
+	// assistant reply after the tool means the turn ended, so a remembered
+	// CurrentTool alone must not keep the agent "working" forever.
+	if s.CurrentTool != "" && s.LastRole != "user" && s.LastRole != "assistant" && s.LastRole != "" {
 		return "working", ""
 	}
 	switch s.LastRole {
 	case "user":
 		return "working", ""
-	case "assistant":
-		// Assistant spoke with no pending tools — likely between turns; prefer
-		// thinking over idle while the process is still alive.
-		return "thinking", ""
 	default:
+		// Assistant spoke with no pending tools: the turn is over and the
+		// agent waits for input. Reporting "thinking" here counted idle
+		// sessions as active and overrode hook-reported completion.
 		return "running", ""
 	}
 }
@@ -59,6 +61,15 @@ func MergeAgentState(existing, incoming string) string {
 		return incoming
 	}
 	if incoming == "" {
+		return existing
+	}
+	// A hook-reported terminal state stands until there is evidence of new
+	// activity; an idle transcript must not hide "completed"/"error".
+	if existing == "completed" || existing == "error" {
+		switch incoming {
+		case "working", "question":
+			return incoming
+		}
 		return existing
 	}
 	if statePriority(existing) >= statePriority(incoming) {

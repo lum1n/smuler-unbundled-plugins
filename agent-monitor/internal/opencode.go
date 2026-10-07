@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -67,11 +66,11 @@ func (r *OpenCodeContextReader) ContextForPID(pid int) AgentSession {
 
 	session := sessions[0]
 	ctx := AgentSession{
-		AgentID:     session.Agent,
-		DisplayName: "OpenCode",
-		SessionID:   session.ID,
-		Task:        session.Title,
-		Model:       session.ModelID,
+		AgentID:      session.Agent,
+		DisplayName:  "OpenCode",
+		SessionID:    session.ID,
+		Task:         session.Title,
+		Model:        session.ModelID,
 		Cost:         session.Cost,
 		TokensInput:  session.TokensInput,
 		TokensOutput: session.TokensOutput,
@@ -190,14 +189,23 @@ func extractMessageField(data, field string) string {
 }
 
 func looksLikeQuestion(text string) bool {
-	lower := strings.ToLower(text)
-	if strings.Contains(text, "?") {
+	// Only the end of the reply matters: a "?" in code, URLs or an earlier
+	// paragraph of a long final summary is not a question to the user.
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	lines := strings.Split(text, "\n")
+	last := strings.TrimSpace(lines[len(lines)-1])
+	last = strings.TrimRight(last, "*_` ")
+	if strings.HasSuffix(last, "?") {
 		return true
 	}
+	lower := strings.ToLower(last)
 	phrases := []string{
 		"do you want", "should i", "would you like", "can you confirm",
 		"please confirm", "confirm to", "awaiting confirmation", "needs your approval",
-		"approve", "permission to", "allow me to", "shall i",
+		"permission to", "allow me to", "shall i",
 	}
 	for _, p := range phrases {
 		if strings.Contains(lower, p) {
@@ -208,7 +216,7 @@ func looksLikeQuestion(text string) bool {
 }
 
 func sqliteQueryJSON[T any](dbPath, query string) ([]T, error) {
-	out, err := exec.Command("sqlite3", "-json", dbPath, query).Output()
+	out, err := commandOutput("sqlite3", "-json", dbPath, query)
 	if err != nil {
 		return nil, err
 	}

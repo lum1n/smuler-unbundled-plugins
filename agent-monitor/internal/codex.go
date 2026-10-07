@@ -1,36 +1,47 @@
 package internal
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 // CodexContextReader reads Codex thread metadata and rollout logs.
 type CodexContextReader struct {
 	home string
 	db   string
+
+	mu     sync.Mutex
+	states map[string]*codexRolloutCache
+}
+
+type codexRolloutCache struct {
+	tail     jsonlTail
+	state    codexRolloutState
+	lastUsed time.Time
 }
 
 type codexThreadRow struct {
-	ID         string `json:"id"`
-	Rollout    string `json:"rollout_path"`
-	CWD        string `json:"cwd"`
-	Title      string `json:"title"`
-	GitBranch  string `json:"git_branch"`
-	Archived   int    `json:"archived"`
-	UpdatedAt  int64  `json:"updated_at"`
+	ID        string `json:"id"`
+	Rollout   string `json:"rollout_path"`
+	CWD       string `json:"cwd"`
+	Title     string `json:"title"`
+	GitBranch string `json:"git_branch"`
+	Archived  int    `json:"archived"`
+	UpdatedAt int64  `json:"updated_at"`
 }
 
 // NewCodexContextReader creates a reader for Codex's local SQLite + rollout logs.
 func NewCodexContextReader() *CodexContextReader {
 	home, _ := os.UserHomeDir()
 	return &CodexContextReader{
-		home: home,
-		db:   filepath.Join(home, ".codex", "logs_2.sqlite"),
+		home:   home,
+		db:     filepath.Join(home, ".codex", "logs_2.sqlite"),
+		states: make(map[string]*codexRolloutCache),
 	}
 }
 
@@ -70,7 +81,7 @@ func (r *CodexContextReader) ContextForPID(pid int) AgentSession {
 
 	rollout := r.resolveRolloutPath(thread.Rollout)
 	if rollout != "" {
-		state := readCodexRolloutState(rollout)
+		state := r.rolloutState(rollout)
 		if state.task != "" {
 			ctx.Task = state.task
 		}
@@ -128,31 +139,37 @@ type codexRolloutState struct {
 	todos          []TodoItem
 }
 
-func readCodexRolloutState(path string) codexRolloutState {
-	file, err := os.Open(path)
-	if err != nil {
-		return codexRolloutState{}
+// rolloutState returns the parsed rollout state, reading only bytes appended
+// since the previous call.
+func (r *CodexContextReader) rolloutState(path string) codexRolloutState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.states == nil {
+		r.states = make(map[string]*codexRolloutCache)
 	}
-	defer file.Close()
-
-	state := codexRolloutState{}
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 2*1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	now := time.Now()
+	for p, c := range r.states {
+		if now.Sub(c.lastUsed) > transcriptCacheTTL {
+			delete(r.states, p)
 		}
-		updateCodexStateFromLine(line, &state)
 	}
-	return state
+	c := r.states[path]
+	if c == nil {
+		c = &codexRolloutCache{tail: jsonlTail{maxInitial: maxInitialTranscriptRead}}
+		r.states[path] = c
+	}
+	c.lastUsed = now
+	_ = c.tail.next(path,
+		func() { c.state = codexRolloutState{} },
+		func(line []byte) { updateCodexStateFromLine(line, &c.state) })
+	st := c.state
+	st.todos = append([]TodoItem(nil), c.state.todos...)
+	return st
 }
 
-func updateCodexStateFromLine(line string, state *codexRolloutState) {
+func updateCodexStateFromLine(line []byte, state *codexRolloutState) {
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+	if err := json.Unmarshal(line, &raw); err != nil {
 		return
 	}
 
@@ -163,35 +180,90 @@ func updateCodexStateFromLine(line string, state *codexRolloutState) {
 				parts = append(parts, strings.TrimSpace(s))
 			}
 		}
-	if len(parts) > 0 {
-		state.task = strings.Join(parts, " ")
-		state.lastRole = "user"
-		state.pendingToolUse = false
-	}
+		if len(parts) > 0 {
+			state.task = strings.Join(parts, " ")
+			state.lastRole = "user"
+			state.pendingToolUse = false
+		}
 	}
 
-	if t, _ := raw["type"].(string); t == "response_item" || t == "event_msg" {
-		state.lastRole = "assistant"
-		if s := extractStringField(raw, "content", "text", "message"); s != "" {
-			state.task = s
-			state.lastText = s
+	lineType, _ := raw["type"].(string)
+	payload, _ := raw["payload"].(map[string]any)
+	payloadType := ""
+	if payload != nil {
+		payloadType, _ = payload["type"].(string)
+	}
+
+	switch lineType {
+	case "turn_context":
+		if model, _ := payload["model"].(string); model != "" {
+			state.model = model
 		}
-		if payload, ok := raw["payload"].(map[string]any); ok {
-			if s := extractStringField(payload, "content", "text", "message"); s != "" {
-				state.task = s
-				state.lastText = s
+	case "event_msg":
+		switch payloadType {
+		case "user_message":
+			// Only real user prompts arrive as user_message events; user-role
+			// response items also include injected environment context.
+			if msg, _ := payload["message"].(string); strings.TrimSpace(msg) != "" {
+				state.task = strings.TrimSpace(msg)
 			}
-			if usage, ok := payload["usage"].(map[string]any); ok {
-				state.tokensInput = int64(coerceFloat(usage["input_tokens"]))
-				state.tokensOutput = int64(coerceFloat(usage["output_tokens"]))
+			state.lastRole = "user"
+			state.pendingToolUse = false
+		case "agent_message":
+			if msg, _ := payload["message"].(string); strings.TrimSpace(msg) != "" {
+				state.lastText = strings.TrimSpace(msg)
+				state.lastRole = "assistant"
+			}
+		case "token_count":
+			if info, ok := payload["info"].(map[string]any); ok {
+				if usage, ok := info["total_token_usage"].(map[string]any); ok {
+					state.tokensInput = int64(coerceFloat(usage["input_tokens"]))
+					state.tokensOutput = int64(coerceFloat(usage["output_tokens"]))
+				}
+			}
+		case "task_complete", "turn_aborted":
+			state.lastRole = "assistant"
+			state.pendingToolUse = false
+			state.currentTool = ""
+			if msg, _ := payload["last_agent_message"].(string); strings.TrimSpace(msg) != "" {
+				state.lastText = strings.TrimSpace(msg)
+			}
+		}
+	case "response_item":
+		switch payloadType {
+		case "message":
+			role, _ := payload["role"].(string)
+			switch role {
+			case "user":
+				state.lastRole = "user"
+				state.pendingToolUse = false
+			case "assistant":
+				state.lastRole = "assistant"
+				state.pendingToolUse = false
+				if s := extractStringField(payload, "content", "text"); s != "" {
+					state.lastText = s
+				}
 			}
 			if model, _ := payload["model"].(string); model != "" {
 				state.model = model
 			}
+		case "function_call", "custom_tool_call", "local_shell_call":
+			name, _ := payload["name"].(string)
+			if name == "" && payloadType == "local_shell_call" {
+				name = "shell"
+			}
+			if name != "" {
+				state.currentTool = name
+			}
+			state.lastRole = "assistant"
+			state.pendingToolUse = true
+		case "function_call_output", "custom_tool_call_output":
+			state.lastRole = "tool"
+			state.pendingToolUse = false
 		}
 	}
 
-	// Codex rollout may contain tool_call blocks.
+	// Older rollout formats may contain top-level tool_call blocks.
 	if toolCalls, ok := raw["tool_calls"].([]any); ok && len(toolCalls) > 0 {
 		state.pendingToolUse = true
 		for _, tc := range toolCalls {
@@ -210,7 +282,7 @@ func updateCodexStateFromLine(line string, state *codexRolloutState) {
 		}
 	}
 
-	if t, _ := raw["type"].(string); t == "tool_result" || t == "function_call_output" {
+	if lineType == "tool_result" || lineType == "function_call_output" {
 		state.pendingToolUse = false
 	}
 }

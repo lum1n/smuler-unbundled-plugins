@@ -6,15 +6,15 @@ import "time"
 type RuleKind string
 
 const (
-	KindAgentsMd     RuleKind = "agents_md"
-	KindCursorRule   RuleKind = "cursor_rule"
-	KindClaudeSkill  RuleKind = "claude_skill"
-	KindClaudeMd     RuleKind = "claude_md"
-	KindCodexConfig  RuleKind = "codex_config"
-	KindPiSystem     RuleKind = "pi_system"
-	KindOpenCode     RuleKind = "opencode_config"
-	KindAiderConfig  RuleKind = "aider_config"
-	KindUnknown      RuleKind = "unknown"
+	KindAgentsMd    RuleKind = "agents_md"
+	KindCursorRule  RuleKind = "cursor_rule"
+	KindClaudeSkill RuleKind = "claude_skill"
+	KindClaudeMd    RuleKind = "claude_md"
+	KindCodexConfig RuleKind = "codex_config"
+	KindPiSystem    RuleKind = "pi_system"
+	KindOpenCode    RuleKind = "opencode_config"
+	KindAiderConfig RuleKind = "aider_config"
+	KindUnknown     RuleKind = "unknown"
 )
 
 // RuleFile represents a single discovered agent configuration file.

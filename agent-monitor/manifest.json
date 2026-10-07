@@ -1,7 +1,7 @@
 {
   "id": "agent-monitor",
   "name": "Agent Monitor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Monitors AI coding agents (Claude Code, Codex, OpenCode, Pi, Cursor, Aider, Archer). Attaches to a shared agent-watcher daemon when tmux-agent-state is present, otherwise starts one; process scan covers agents outside tmux.",
   "icon": {
     "type": "sfSymbol",

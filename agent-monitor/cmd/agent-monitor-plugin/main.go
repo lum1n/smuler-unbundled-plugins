@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lum1n/smuler/plugins/agent-monitor/internal"
@@ -38,16 +41,31 @@ type handler struct {
 	driftAnalyzer *drift.Analyzer
 	watcher       *watcher.Client
 	health        string
+	// repoRoots maps repo names shown in suggestions to their root paths so
+	// "Apply" writes into the right repository.
+	repoRoots    map[string]string
+	pollInterval time.Duration
 }
+
+const (
+	defaultPollInterval = 5 * time.Second
+	// osascriptTimeout bounds AppleScript actions; they run under the SDK's
+	// handler lock, so a hung osascript would block every refresh.
+	osascriptTimeout = 10 * time.Second
+	// maxEnrichWorkers bounds concurrent per-agent context lookups.
+	maxEnrichWorkers = 4
+)
 
 func newHandler() *handler {
 	store := internal.NewAgentStore()
 	return &handler{
 		store:         store,
 		prevStates:    make(map[string]string),
+		repoRoots:     make(map[string]string),
+		pollInterval:  defaultPollInterval,
 		cli:           internal.NewClaudeHookInstaller(),
 		cxh:           internal.NewCodexHookInstaller(),
-		procdetect:    internal.NewProcDetector(store, 5*time.Second),
+		procdetect:    internal.NewProcDetector(store, defaultPollInterval),
 		gcReader:      internal.NewGenericContextReader(),
 		ccReader:      internal.NewClaudeContextReader(),
 		cxReader:      internal.NewCodexContextReader(),
@@ -99,23 +117,13 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 
 	switch actionType {
 	case "stop_agent":
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			return false, fmt.Sprintf("process %d not found", pid)
-		}
-		if err := proc.Signal(os.Interrupt); err != nil {
-			return false, fmt.Sprintf("failed to signal: %v", err)
-		}
-		return true, ""
+		return signalAgent(pid, syscall.SIGINT)
 	case "kill_agent":
-		exec.Command("kill", "-9", pidStr).Run()
-		return true, ""
+		return signalAgent(pid, syscall.SIGKILL)
 	case "pause_agent":
-		exec.Command("kill", "-STOP", pidStr).Run()
-		return true, ""
+		return signalAgent(pid, syscall.SIGSTOP)
 	case "resume_agent":
-		exec.Command("kill", "-CONT", pidStr).Run()
-		return true, ""
+		return signalAgent(pid, syscall.SIGCONT)
 	case "focus_agent":
 		return h.focusAgent(pid)
 	case "approve_agent":
@@ -125,6 +133,25 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 	default:
 		return false, "unknown action: " + actionType
 	}
+}
+
+// signalAgent sends sig to pid and reports failures (previously kill errors
+// were ignored and the action always reported success).
+func signalAgent(pid int, sig syscall.Signal) (bool, string) {
+	if pid <= 0 {
+		return false, "invalid pid"
+	}
+	if err := syscall.Kill(pid, sig); err != nil {
+		return false, fmt.Sprintf("failed to signal process %d: %v", pid, err)
+	}
+	return true, ""
+}
+
+// runOSAScript runs an AppleScript snippet with a timeout.
+func runOSAScript(script string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), osascriptTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "osascript", "-e", script).Run()
 }
 
 func (h *handler) dispatchTask(pidStr, task, contextStr string) (bool, string) {
@@ -144,12 +171,11 @@ tell application "System Events"
 	keystroke return
 end tell
 `, escapeAppleScript(task))
-	cmd := exec.Command("osascript", "-e", script)
-	if err := cmd.Run(); err != nil {
+	if err := runOSAScript(script); err != nil {
 		return false, fmt.Sprintf("failed to dispatch task: %v", err)
 	}
 
-	sdk.Log("dispatched task to pid %d: %s (context: %s)", pid, task, contextStr)
+	sdk.Log("dispatched task to pid %d", pid)
 	sdk.Emit(sdk.Event{
 		Type:     "agent_dispatched",
 		Severity: sdk.SeverityInfo,
@@ -173,8 +199,7 @@ tell application "System Events"
 	keystroke return
 end tell
 `, escapeAppleScript(handoffMsg))
-	cmd := exec.Command("osascript", "-e", script)
-	if err := cmd.Run(); err != nil {
+	if err := runOSAScript(script); err != nil {
 		return false, fmt.Sprintf("failed to handoff context: %v", err)
 	}
 
@@ -196,8 +221,7 @@ tell application "System Events"
 	set frontmost of process "Terminal" to true
 end tell
 `)
-	cmd := exec.Command("osascript", "-e", script)
-	if err := cmd.Run(); err != nil {
+	if err := runOSAScript(script); err != nil {
 		return false, fmt.Sprintf("failed to focus Terminal: %v", err)
 	}
 	return true, ""
@@ -214,8 +238,7 @@ tell application "System Events"
 	keystroke return
 end tell
 `, input)
-	cmd := exec.Command("osascript", "-e", script)
-	if err := cmd.Run(); err != nil {
+	if err := runOSAScript(script); err != nil {
 		return false, fmt.Sprintf("failed to send input: %v", err)
 	}
 	return true, ""
@@ -251,7 +274,17 @@ func (h *handler) handleSuggestionAction(id string) (bool, string) {
 	case "preview_suggestion-":
 		return true, fmt.Sprintf("Proposed change to %s:\n%s", suggestion.ProposedPath, suggestion.ProposedPatch)
 	case "apply_suggestion-":
-		if err := h.driftAnalyzer.ApplySuggestion(*suggestion); err != nil {
+		s := *suggestion
+		if s.ProposedPath != "" && !filepath.IsAbs(s.ProposedPath) {
+			// Proposed paths are repo-relative; resolving them against the
+			// plugin's working directory wrote AGENTS.md to the wrong place.
+			root := h.repoRoots[s.Repo]
+			if root == "" {
+				return false, "repository for suggestion is not currently active: " + s.Repo
+			}
+			s.ProposedPath = filepath.Join(root, s.ProposedPath)
+		}
+		if err := h.driftAnalyzer.ApplySuggestion(s); err != nil {
 			return false, fmt.Sprintf("failed to apply: %v", err)
 		}
 		return true, ""
@@ -283,6 +316,8 @@ func (h *handler) openFile(path string) (bool, string) {
 	if err := cmd.Start(); err != nil {
 		return false, fmt.Sprintf("failed to open %s: %v", path, err)
 	}
+	// Reap the child so repeated opens do not leave zombie processes.
+	go func() { _ = cmd.Wait() }()
 	return true, ""
 }
 
@@ -290,23 +325,18 @@ func (h *handler) Initialize(params sdk.InitializeParams) string {
 	paths := sdk.HostPathsFromConfig(params.Config)
 	socketPath := filepath.Join(paths.CacheDir, "agent-monitor.sock")
 
-	if h.socket != nil {
-		h.socket.Stop()
-	}
-	h.socket = internal.NewSocketListener(socketPath, h.store)
-
-	if err := h.socket.Start(); err != nil {
-		sdk.Log("socket start failed: %v", err)
-		h.health = sdk.HealthDegraded
-		return sdk.HealthDegraded
-	}
-
-	if interval := params.Config["agent.pollInterval"]; interval != "" {
-		if n, err := strconv.Atoi(interval); err == nil && n > 0 {
-			h.procdetect.Stop()
-			h.procdetect = internal.NewProcDetector(h.store, time.Duration(n)*time.Second)
+	if v, err := strconv.Atoi(strings.TrimSpace(params.Config["agent.pollInterval"])); err == nil {
+		if v < 1 {
+			v = 1
+		} else if v > 300 {
+			v = 300
 		}
+		h.pollInterval = time.Duration(v) * time.Second
 	}
+
+	// Process detection works without the hook socket, so start it first;
+	// previously a socket failure disabled agent detection entirely.
+	h.procdetect.SetInterval(h.pollInterval)
 	h.procdetect.Start()
 	if err := h.cli.Install(); err != nil {
 		sdk.Log("claude hook install failed: %v", err)
@@ -315,11 +345,27 @@ func (h *handler) Initialize(params sdk.InitializeParams) string {
 		sdk.Log("codex hook install failed: %v", err)
 	}
 
+	h.health = sdk.HealthOK
+	if h.socket != nil {
+		h.socket.Stop()
+	}
+	h.socket = internal.NewSocketListener(socketPath, h.store)
+	if err := h.socket.Start(); err != nil {
+		// Process detection and the watcher still work without hook events.
+		sdk.Log("socket start failed: %v", err)
+		h.health = sdk.HealthDegraded
+	}
+
 	h.startWatcher(params)
 	return h.health
 }
 
 func (h *handler) startWatcher(params sdk.InitializeParams) {
+	// Re-initialize must not leave the previous watcher client running.
+	if h.watcher != nil {
+		h.watcher.Stop()
+		h.watcher = nil
+	}
 	enabled := true
 	if v := params.Config["agent.watcherEnabled"]; v == "false" || v == "0" {
 		enabled = false
@@ -602,7 +648,7 @@ func (h *handler) GetStatus() sdk.Snapshot {
 		Items:        items,
 		Actions:      dispatchActions,
 		Alerts:       alerts,
-		RefreshAfter: 5,
+		RefreshAfter: int(h.pollInterval / time.Second),
 		Health:       h.snapshotHealth(),
 	}
 }
@@ -632,6 +678,7 @@ func (h *handler) setupItems(agents []internal.AgentSession) []sdk.Item {
 	roots := make([]string, 0, len(repoRoots))
 	for r := range repoRoots {
 		roots = append(roots, r)
+		h.repoRoots[filepath.Base(r)] = r
 	}
 
 	files := h.rulesScanner.Scan(roots)
@@ -654,7 +701,7 @@ func (h *handler) setupItems(agents []internal.AgentSession) []sdk.Item {
 			detail = f.Path
 		}
 		items = append(items, sdk.Item{
-			ID:       "setup-" + f.RepoName + "-" + f.Kind.String() + "-" + filepath.Base(f.Path),
+			ID:       "setup-" + f.RepoName + "-" + f.Kind.String() + "-" + setupFileKey(f),
 			Title:    f.Title,
 			Subtitle: f.Kind.DisplayName() + " · " + f.RepoName,
 			Detail:   detail,
@@ -689,6 +736,15 @@ func (h *handler) setupItems(agents []internal.AgentSession) []sdk.Item {
 	}
 
 	return items
+}
+
+// setupFileKey identifies a rule file within its repo. The base name alone
+// collided for every .claude/skills/*/SKILL.md, producing duplicate item IDs.
+func setupFileKey(f rules.RuleFile) string {
+	if rel, err := filepath.Rel(f.RepoRoot, f.Path); err == nil {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.Base(f.Path)
 }
 
 type missingRule struct {
@@ -805,53 +861,70 @@ func (h *handler) suggestionItems(agents []internal.AgentSession, setup []sdk.It
 	return items
 }
 
+// enrichSessions adds repo and transcript context to each session. Lookups
+// shell out (lsof, git, sqlite3), so agents are enriched concurrently.
 func (h *handler) enrichSessions(sessions []internal.AgentSession) []internal.AgentSession {
 	out := make([]internal.AgentSession, len(sessions))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxEnrichWorkers)
 	for i, a := range sessions {
 		out[i] = a.Clone()
 		if a.PID <= 0 {
 			continue
 		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(dst *internal.AgentSession) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			h.enrichSession(dst)
+		}(&out[i])
+	}
+	wg.Wait()
+	return out
+}
 
-		gc := h.gcReader.ContextForPID(a.PID)
-		if gc.Available {
-			if out[i].CWD == "" {
-				out[i].CWD = gc.CWD
-			}
-			if out[i].RepoName == "" {
-				out[i].RepoName = gc.RepoName
-			}
-			if out[i].RepoFullName == "" {
-				out[i].RepoFullName = gc.RepoFullName
-			}
-			if out[i].Branch == "" {
-				out[i].Branch = gc.Branch
-			}
-			if !out[i].IsRepoDirty {
-				out[i].IsRepoDirty = gc.IsRepoDirty
-			}
-			if out[i].FilesChanged == 0 {
-				out[i].FilesChanged = gc.FilesChanged
-			}
+func (h *handler) enrichSession(dst *internal.AgentSession) {
+	gc := h.gcReader.ContextForPID(dst.PID)
+	if gc.Available {
+		if dst.CWD == "" {
+			dst.CWD = gc.CWD
 		}
-
-		var ctx internal.AgentSession
-		switch a.AgentID {
-		case "opencode":
-			ctx = h.ocReader.ContextForPID(a.PID)
-		case "claude":
-			ctx = h.ccReader.ContextForPID(a.PID)
-		case "codex":
-			ctx = h.cxReader.ContextForPID(a.PID)
-		case "pi":
-			ctx = h.piReader.ContextForPID(a.PID)
+		if dst.RepoRoot == "" {
+			dst.RepoRoot = gc.RepoRoot
 		}
-
-		if ctx.Available {
-			mergeSessionContext(&out[i], ctx)
+		if dst.RepoName == "" {
+			dst.RepoName = gc.RepoName
+		}
+		if dst.RepoFullName == "" {
+			dst.RepoFullName = gc.RepoFullName
+		}
+		if dst.Branch == "" {
+			dst.Branch = gc.Branch
+		}
+		if !dst.IsRepoDirty {
+			dst.IsRepoDirty = gc.IsRepoDirty
+		}
+		if dst.FilesChanged == 0 {
+			dst.FilesChanged = gc.FilesChanged
 		}
 	}
-	return out
+
+	var ctx internal.AgentSession
+	switch dst.AgentID {
+	case "opencode":
+		ctx = h.ocReader.ContextForPID(dst.PID)
+	case "claude":
+		ctx = h.ccReader.ContextForPID(dst.PID)
+	case "codex":
+		ctx = h.cxReader.ContextForPID(dst.PID)
+	case "pi":
+		ctx = h.piReader.ContextForPID(dst.PID)
+	}
+
+	if ctx.Available {
+		mergeSessionContext(dst, ctx)
+	}
 }
 
 func mergeSessionContext(dst *internal.AgentSession, src internal.AgentSession) {
@@ -1032,12 +1105,12 @@ func (h *handler) Shutdown() {
 	if h.watcher != nil {
 		h.watcher.Stop()
 	}
+	h.procdetect.Stop()
 	if h.socket != nil {
 		h.socket.Stop()
 	}
 	h.cli.Uninstall()
 	h.cxh.Uninstall()
-	h.procdetect.Stop()
 }
 
 func main() {
@@ -1053,4 +1126,3 @@ func escapeAppleScript(s string) string {
 	s = strings.ReplaceAll(s, "'", "'\\''")
 	return s
 }
-

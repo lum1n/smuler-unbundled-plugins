@@ -1,17 +1,32 @@
 package internal
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // PiContextReader reads Pi session files from ~/.pi/agent/sessions.
 type PiContextReader struct {
 	baseDir string
+
+	mu     sync.Mutex
+	states map[string]*piSessionCache
+}
+
+// piSessionCache keeps the parsed session tree so refreshes only parse newly
+// appended entries and only re-derive context when something changed.
+type piSessionCache struct {
+	tail     jsonlTail
+	state    piSessionState
+	version  int
+	derived  int
+	result   AgentSession
+	lastUsed time.Time
 }
 
 // NewPiContextReader creates a reader for Pi's local session files.
@@ -22,7 +37,7 @@ func NewPiContextReader() *PiContextReader {
 
 // NewPiContextReaderAt creates a reader using an explicit base directory.
 func NewPiContextReaderAt(baseDir string) *PiContextReader {
-	return &PiContextReader{baseDir: baseDir}
+	return &PiContextReader{baseDir: baseDir, states: make(map[string]*piSessionCache)}
 }
 
 // ContextForPID returns Pi session context for the given process.
@@ -75,30 +90,46 @@ func (r *PiContextReader) findSessionFile(cwd string) string {
 }
 
 func (r *PiContextReader) readSession(path, cwd string) AgentSession {
-	file, err := os.Open(path)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.states == nil {
+		r.states = make(map[string]*piSessionCache)
+	}
+	now := time.Now()
+	for p, c := range r.states {
+		if now.Sub(c.lastUsed) > transcriptCacheTTL {
+			delete(r.states, p)
+		}
+	}
+	c := r.states[path]
+	if c == nil {
+		c = &piSessionCache{state: piSessionState{cwd: cwd}, derived: -1}
+		r.states[path] = c
+	}
+	c.lastUsed = now
+
+	err := c.tail.next(path,
+		func() {
+			c.state = piSessionState{cwd: cwd}
+			c.version++
+		},
+		func(line []byte) {
+			var entry piEntry
+			if err := json.Unmarshal(line, &entry); err != nil {
+				return
+			}
+			c.state.addEntry(entry)
+			c.version++
+		})
 	if err != nil {
+		delete(r.states, path)
 		return AgentSession{}
 	}
-	defer file.Close()
-
-	state := piSessionState{cwd: cwd}
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 2*1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var entry piEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
-		}
-		state.addEntry(entry)
+	if c.derived != c.version {
+		c.result = c.state.toAgentSession()
+		c.derived = c.version
 	}
-
-	return state.toAgentSession()
+	return c.result
 }
 
 type piEntry struct {
@@ -174,6 +205,11 @@ func (s *piSessionState) toAgentSession() AgentSession {
 		return AgentSession{}
 	}
 
+	// Derived fields are recomputed from the tree on every call.
+	s.lastPrompt, s.currentTool, s.currentFile = "", "", ""
+	s.model, s.provider = "", ""
+	s.tokensInput, s.tokensOutput, s.cacheRead, s.cacheWrite = 0, 0, 0, 0
+	s.cost = 0
 	s.walkLeafToRoot(s.leafID)
 
 	task := s.sessionName
@@ -277,8 +313,11 @@ func extractPiAssistantText(msg map[string]any) string {
 	return ""
 }
 
+// walkLeafToRoot collects the active branch and applies it root-first, so the
+// latest prompt/tool/model win (applying leaf-first left the oldest values).
 func (s *piSessionState) walkLeafToRoot(leafID string) {
 	visited := make(map[string]bool)
+	var path []piEntry
 	current := leafID
 	for current != "" && !visited[current] {
 		visited[current] = true
@@ -286,8 +325,11 @@ func (s *piSessionState) walkLeafToRoot(leafID string) {
 		if !ok {
 			break
 		}
-		s.applyEntry(e)
+		path = append(path, e)
 		current = e.ParentID
+	}
+	for i := len(path) - 1; i >= 0; i-- {
+		s.applyEntry(path[i])
 	}
 }
 
