@@ -2,10 +2,15 @@ package imap
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -15,18 +20,31 @@ import (
 	email "github.com/lum1n/smuler/plugins/email/internal"
 )
 
+// Network bounds: a stalled server must never block the plugin's handler
+// (the SDK serializes calls, so one hung IMAP read would freeze every later
+// refresh and action).
+var (
+	dialTimeout    = 15 * time.Second
+	commandTimeout = 30 * time.Second
+)
+
 type Provider struct {
 	acc         email.Account
 	client      *client.Client
 	mu          sync.Mutex
 	prevUIDs    map[uint32]struct{}
 	initialized bool
+	uidValidity uint32
+	// cache holds already-fetched unread messages by UID so each refresh only
+	// FETCHes envelopes for messages it has not seen before.
+	cache map[uint32]email.EmailMessage
 }
 
 func New(acc email.Account) *Provider {
 	return &Provider{
 		acc:      acc,
 		prevUIDs: make(map[uint32]struct{}),
+		cache:    make(map[uint32]email.EmailMessage),
 	}
 }
 
@@ -40,50 +58,181 @@ func (p *Provider) Connect() error {
 
 func (p *Provider) connectLocked() error {
 	if p.client != nil {
-		return nil
+		select {
+		case <-p.client.LoggedOut():
+			// Server dropped the connection; reconnect below.
+			p.client = nil
+		default:
+			return nil
+		}
+	}
+	if p.acc.Username == "" || p.acc.Password == "" {
+		return fmt.Errorf("%w: username and password (app password) required", email.ErrAuthFailed)
 	}
 	addr := fmt.Sprintf("%s:%d", p.acc.Server, p.acc.Port)
-	c, err := client.DialTLS(addr, nil)
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	var c *client.Client
+	var err error
+	if p.acc.TLS {
+		c, err = client.DialWithDialerTLS(dialer, addr, &tls.Config{ServerName: p.acc.Server})
+	} else {
+		c, err = client.DialWithDialer(dialer, addr)
+	}
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
+	c.Timeout = commandTimeout
+	if !p.acc.TLS {
+		if ok, _ := c.SupportStartTLS(); ok {
+			if err := c.StartTLS(&tls.Config{ServerName: p.acc.Server}); err != nil {
+				_ = c.Close()
+				return fmt.Errorf("starttls %s: %w", addr, err)
+			}
+		}
+	}
 	if err := c.Login(p.acc.Username, p.acc.Password); err != nil {
-		c.Close()
-		return fmt.Errorf("login %s: %w", p.acc.Username, err)
+		_ = c.Close()
+		if isConnError(err) {
+			return fmt.Errorf("login %s: %w", p.acc.Username, err)
+		}
+		return fmt.Errorf("%w: login %s: %v", email.ErrAuthFailed, p.acc.Username, err)
 	}
 	p.client = c
 	return nil
 }
 
-func (p *Provider) FetchUnread(ctx context.Context, limit int) ([]email.EmailMessage, error) {
+// isConnError reports transport failures (timeouts, resets, EOF) as opposed to
+// a server NO/BAD reply, which for LOGIN means rejected credentials.
+func isConnError(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return strings.Contains(err.Error(), "connection closed")
+}
+
+// resetLocked drops a connection after any command error so the next call
+// reconnects instead of reusing a dead or desynchronized session.
+func (p *Provider) resetLocked() {
+	if p.client == nil {
+		return
+	}
+	_ = p.client.Close()
+	p.client = nil
+}
+
+func (p *Provider) FetchUnread(ctx context.Context, limit int) (email.UnreadResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if err := p.connectLocked(); err != nil {
-		return nil, err
+	reused := p.client != nil
+	res, err := p.fetchUnreadLocked(limit)
+	if err != nil {
+		p.resetLocked()
+		// A long-lived session may have been dropped by the server (idle
+		// timeout); retry once on a fresh connection before reporting.
+		if reused && !errors.Is(err, email.ErrAuthFailed) {
+			res, err = p.fetchUnreadLocked(limit)
+			if err != nil {
+				p.resetLocked()
+			}
+		}
 	}
+	return res, err
+}
 
-	if _, err := p.client.Select("INBOX", false); err != nil {
+func (p *Provider) selectInboxLocked() (*imap.MailboxStatus, error) {
+	mbox, err := p.client.Select("INBOX", false)
+	if err != nil {
 		return nil, fmt.Errorf("select INBOX: %w", err)
+	}
+	if mbox.UidValidity != p.uidValidity {
+		// UIDs from a previous validity epoch are meaningless now.
+		p.uidValidity = mbox.UidValidity
+		p.cache = make(map[uint32]email.EmailMessage)
+		p.prevUIDs = make(map[uint32]struct{})
+		p.initialized = false
+	}
+	return mbox, nil
+}
+
+func (p *Provider) fetchUnreadLocked(limit int) (email.UnreadResult, error) {
+	if err := p.connectLocked(); err != nil {
+		return email.UnreadResult{}, err
+	}
+	if _, err := p.selectInboxLocked(); err != nil {
+		return email.UnreadResult{}, err
 	}
 
 	criteria := imap.NewSearchCriteria()
 	criteria.WithoutFlags = []string{imap.SeenFlag}
 	uids, err := p.client.UidSearch(criteria)
 	if err != nil {
-		return nil, fmt.Errorf("search unread: %w", err)
+		return email.UnreadResult{}, fmt.Errorf("search unread: %w", err)
+	}
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+
+	res := email.UnreadResult{Total: len(uids)}
+	res.NewUIDs = p.trackUIDs(uids)
+
+	window := uids
+	if limit > 0 && len(window) > limit {
+		window = window[len(window)-limit:]
 	}
 
-	if len(uids) == 0 {
-		p.prevUIDs = make(map[uint32]struct{})
-		p.initialized = true
-		return nil, nil
+	var missing []uint32
+	for _, uid := range window {
+		if _, ok := p.cache[uid]; !ok {
+			missing = append(missing, uid)
+		}
+	}
+	if len(missing) > 0 {
+		fetched, err := p.fetchMessagesLocked(missing)
+		if err != nil {
+			return email.UnreadResult{}, err
+		}
+		for _, em := range fetched {
+			p.cache[em.UID] = em
+		}
 	}
 
-	if len(uids) > limit {
-		uids = uids[len(uids)-limit:]
+	inWindow := make(map[uint32]struct{}, len(window))
+	for i := len(window) - 1; i >= 0; i-- {
+		uid := window[i]
+		inWindow[uid] = struct{}{}
+		if em, ok := p.cache[uid]; ok {
+			res.Messages = append(res.Messages, em)
+		}
 	}
+	for uid := range p.cache {
+		if _, ok := inWindow[uid]; !ok {
+			delete(p.cache, uid)
+		}
+	}
+	return res, nil
+}
 
+// trackUIDs records the full unread UID set and returns UIDs not present in
+// the previous poll. The first poll after (re)initialization reports nothing,
+// so existing unread mail does not trigger a notification burst.
+func (p *Provider) trackUIDs(uids []uint32) []uint32 {
+	var newUIDs []uint32
+	if p.initialized {
+		for _, uid := range uids {
+			if _, seen := p.prevUIDs[uid]; !seen {
+				newUIDs = append(newUIDs, uid)
+			}
+		}
+	}
+	p.prevUIDs = make(map[uint32]struct{}, len(uids))
+	for _, uid := range uids {
+		p.prevUIDs[uid] = struct{}{}
+	}
+	p.initialized = true
+	return newUIDs
+}
+
+func (p *Provider) fetchMessagesLocked(uids []uint32) ([]email.EmailMessage, error) {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uids...)
 
@@ -108,18 +257,6 @@ func (p *Provider) FetchUnread(ctx context.Context, limit int) ([]email.EmailMes
 	if fetchErr := <-done; fetchErr != nil {
 		return nil, fmt.Errorf("fetch: %w", fetchErr)
 	}
-
-	current := make(map[uint32]struct{}, len(results))
-	for _, em := range results {
-		current[em.UID] = struct{}{}
-	}
-	p.prevUIDs = current
-	p.initialized = true
-
-	for i, j := 0, len(results)-1; i < j; i, j = i+1, j-1 {
-		results[i], results[j] = results[j], results[i]
-	}
-
 	return results, nil
 }
 
@@ -212,78 +349,70 @@ func formatBodyStructure(bs *imap.BodyStructure) string {
 	return ""
 }
 
+// ensureInboxLocked connects if needed and makes sure INBOX is selected,
+// since UID STORE/MOVE require a selected mailbox.
+func (p *Provider) ensureInboxLocked() error {
+	if err := p.connectLocked(); err != nil {
+		return err
+	}
+	if mbox := p.client.Mailbox(); mbox != nil && strings.EqualFold(mbox.Name, "INBOX") {
+		return nil
+	}
+	_, err := p.selectInboxLocked()
+	return err
+}
+
 func (p *Provider) MarkRead(uid uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.client == nil {
-		return fmt.Errorf("not connected")
+	if err := p.ensureInboxLocked(); err != nil {
+		p.resetLocked()
+		return err
 	}
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uid)
 	item := imap.FormatFlagsOp(imap.AddFlags, true)
 	flags := []interface{}{imap.SeenFlag}
-	return p.client.UidStore(seqSet, item, flags, nil)
-}
-
-func (p *Provider) Archive(uid uint32) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.client == nil {
-		return fmt.Errorf("not connected")
+	if err := p.client.UidStore(seqSet, item, flags, nil); err != nil {
+		p.resetLocked()
+		return err
 	}
-	seqSet := new(imap.SeqSet)
-	seqSet.AddNum(uid)
-	if err := p.archiveToFolder(seqSet); err != nil {
-		item := imap.FormatFlagsOp(imap.AddFlags, true)
-		flags := []interface{}{imap.SeenFlag, imap.DeletedFlag}
-		if storeErr := p.client.UidStore(seqSet, item, flags, nil); storeErr != nil {
-			return fmt.Errorf("archive fallback failed: %w", storeErr)
-		}
-		_ = p.client.Expunge(nil)
-	}
+	delete(p.cache, uid)
 	return nil
 }
 
-func (p *Provider) archiveToFolder(seqSet *imap.SeqSet) error {
-	folders := []string{"Archive", "[Gmail]/All Mail"}
-	for _, folder := range folders {
-		if err := p.client.UidCopy(seqSet, folder); err == nil {
-			item := imap.FormatFlagsOp(imap.AddFlags, true)
-			flags := []interface{}{imap.DeletedFlag}
-			_ = p.client.UidStore(seqSet, item, flags, nil)
-			_ = p.client.Expunge(nil)
-			return nil
-		}
-	}
-	return fmt.Errorf("no archive folder found")
-}
-
-func (p *Provider) PollNewUIDs(ctx context.Context) ([]uint32, error) {
+// Archive moves the message out of INBOX into the provider's archive folder.
+// It never falls back to deleting: if no archive folder exists the message is
+// left untouched and an error is returned.
+func (p *Provider) Archive(uid uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.initialized || p.client == nil {
-		return nil, nil
+	if err := p.ensureInboxLocked(); err != nil {
+		p.resetLocked()
+		return err
 	}
-	if _, err := p.client.Select("INBOX", false); err != nil {
-		return nil, err
-	}
-	criteria := imap.NewSearchCriteria()
-	criteria.WithoutFlags = []string{imap.SeenFlag}
-	uids, err := p.client.UidSearch(criteria)
-	if err != nil {
-		return nil, err
-	}
-	var newUIDs []uint32
-	for _, uid := range uids {
-		if _, seen := p.prevUIDs[uid]; !seen {
-			newUIDs = append(newUIDs, uid)
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(uid)
+	var lastErr error
+	for _, folder := range archiveFolders(p.acc.Provider) {
+		// UidMove uses MOVE when supported, else COPY+STORE+EXPUNGE.
+		if lastErr = p.client.UidMove(seqSet, folder); lastErr == nil {
+			delete(p.cache, uid)
+			return nil
+		}
+		if isConnError(lastErr) {
+			p.resetLocked()
+			return lastErr
 		}
 	}
-	p.prevUIDs = make(map[uint32]struct{}, len(uids))
-	for _, uid := range uids {
-		p.prevUIDs[uid] = struct{}{}
+	return fmt.Errorf("no archive folder found: %w", lastErr)
+}
+
+func archiveFolders(provider string) []string {
+	if provider == email.ProviderGmail {
+		return []string{"[Gmail]/All Mail", "Archive"}
 	}
-	return newUIDs, nil
+	return []string{"Archive", "[Gmail]/All Mail"}
 }
 
 func (p *Provider) Close() error {

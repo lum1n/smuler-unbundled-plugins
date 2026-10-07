@@ -1,7 +1,7 @@
 {
   "id": "email",
   "name": "Email",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Unread email count and recent messages from Gmail, Outlook, iCloud, and IMAP inboxes",
   "icon": {
     "type": "sfSymbol",
