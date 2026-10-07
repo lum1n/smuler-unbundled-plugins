@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +18,21 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	apiKey     string
+
+	cacheMu sync.Mutex
+	cache   map[string]enrichCacheEntry
 }
+
+// enrichCacheEntry remembers per-agent detail fetched for a list row so an
+// unchanged, settled agent is not re-fetched (3 requests) on every refresh.
+type enrichCacheEntry struct {
+	updatedAt   string
+	latestRunID string
+	enriched    EnrichedAgent
+}
+
+// maxListPages bounds pagination so a misbehaving cursor cannot loop forever.
+const maxListPages = 50
 
 // NewClient creates an API client. apiKey must be non-empty before requests.
 func NewClient(apiKey string, httpClient *http.Client) *Client {
@@ -34,6 +49,9 @@ func NewClient(apiKey string, httpClient *http.Client) *Client {
 // SetAPIKey updates the API key used for requests.
 func (c *Client) SetAPIKey(apiKey string) {
 	c.apiKey = strings.TrimSpace(apiKey)
+	c.cacheMu.Lock()
+	c.cache = nil
+	c.cacheMu.Unlock()
 }
 
 // SetBaseURL overrides the API base URL (for tests).
@@ -57,7 +75,8 @@ func (c *Client) ListAllAgents(ctx context.Context, opts ListOptions) ([]AgentLi
 
 	var all []AgentListItem
 	cursor := ""
-	for {
+	seen := map[string]bool{}
+	for page := 0; page < maxListPages; page++ {
 		q := url.Values{}
 		q.Set("limit", fmt.Sprintf("%d", pageLimit))
 		if cursor != "" {
@@ -74,9 +93,10 @@ func (c *Client) ListAllAgents(ctx context.Context, opts ListOptions) ([]AgentLi
 			return nil, err
 		}
 		all = append(all, resp.Items...)
-		if resp.NextCursor == "" {
+		if resp.NextCursor == "" || seen[resp.NextCursor] {
 			break
 		}
+		seen[resp.NextCursor] = true
 		cursor = resp.NextCursor
 	}
 	return all, nil
@@ -140,23 +160,24 @@ func (c *Client) EnrichAgents(ctx context.Context, agents []AgentListItem, opts 
 		out[i] = EnrichedAgent{List: a}
 	}
 
+	c.cacheMu.Lock()
+	prevCache := c.cache
+	c.cacheMu.Unlock()
+
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var firstErr error
-
-	recordErr := func(err error) {
-		if err == nil {
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
+	nextCache := make(map[string]enrichCacheEntry, limit)
 
 	for i := 0; i < limit; i++ {
+		agent := agents[i]
+		if entry, ok := prevCache[agent.ID]; ok && entry.reusableFor(agent) {
+			e := entry.enriched
+			e.List = agent
+			out[i] = e
+			nextCache[agent.ID] = entry
+			continue
+		}
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -164,43 +185,101 @@ func (c *Client) EnrichAgents(ctx context.Context, agents []AgentListItem, opts 
 			defer func() { <-sem }()
 
 			agent := agents[idx]
-			enriched := EnrichedAgent{List: agent}
-
-			detail, err := c.GetAgent(ctx, agent.ID)
-			if err != nil {
-				recordErr(err)
-			} else {
-				enriched.Detail = detail
-			}
-
-			runID := agent.LatestRunID
-			if enriched.Detail != nil && enriched.Detail.LatestRunID != "" {
-				runID = enriched.Detail.LatestRunID
-			}
-			if runID != "" {
-				run, err := c.GetRun(ctx, agent.ID, runID)
-				if err != nil {
-					recordErr(err)
-				} else {
-					enriched.Run = run
-				}
-			}
-
-			usage, err := c.GetUsage(ctx, agent.ID)
-			if err != nil {
-				recordErr(err)
-			} else {
-				enriched.Usage = usage
-			}
+			enriched := c.enrichOne(ctx, agent)
 
 			mu.Lock()
 			out[idx] = enriched
+			if enriched.complete() {
+				nextCache[agent.ID] = enrichCacheEntry{
+					updatedAt:   agent.UpdatedAt,
+					latestRunID: agent.LatestRunID,
+					enriched:    enriched,
+				}
+			}
 			mu.Unlock()
 		}(i)
 	}
 
 	wg.Wait()
+
+	c.cacheMu.Lock()
+	c.cache = nextCache
+	c.cacheMu.Unlock()
 	return out
+}
+
+// enrichOne fetches detail, latest run, and usage for one agent. Detail and
+// usage are independent, and the run can start immediately when the list row
+// already names the latest run, so the three requests overlap.
+func (c *Client) enrichOne(ctx context.Context, agent AgentListItem) EnrichedAgent {
+	enriched := EnrichedAgent{List: agent}
+	var wg sync.WaitGroup
+
+	fetchRun := func(runID string) {
+		if runID == "" {
+			return
+		}
+		if run, err := c.GetRun(ctx, agent.ID, runID); err == nil {
+			enriched.Run = run
+		}
+	}
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if usage, err := c.GetUsage(ctx, agent.ID); err == nil {
+			enriched.Usage = usage
+		}
+	}()
+	if agent.LatestRunID != "" {
+		go func() {
+			defer wg.Done()
+			fetchRun(agent.LatestRunID)
+		}()
+		if detail, err := c.GetAgent(ctx, agent.ID); err == nil {
+			enriched.Detail = detail
+		}
+	} else {
+		go func() {
+			defer wg.Done()
+			if detail, err := c.GetAgent(ctx, agent.ID); err == nil {
+				enriched.Detail = detail
+				fetchRun(detail.LatestRunID)
+			}
+		}()
+	}
+	wg.Wait()
+	return enriched
+}
+
+// complete reports whether every detail fetch succeeded and the agent is in a
+// settled state, i.e. its enrichment is safe to reuse while the list row is unchanged.
+func (e EnrichedAgent) complete() bool {
+	if e.Detail == nil || e.Usage == nil {
+		return false
+	}
+	runID := e.List.LatestRunID
+	if runID == "" {
+		runID = e.Detail.LatestRunID
+	}
+	if runID != "" && e.Run == nil {
+		return false
+	}
+	status := e.List.Status
+	if e.Run != nil && e.Run.Status != "" {
+		status = e.Run.Status
+	}
+	switch strings.ToUpper(status) {
+	case "RUNNING", "CREATING", "ACTIVE":
+		return false
+	}
+	return true
+}
+
+func (entry enrichCacheEntry) reusableFor(agent AgentListItem) bool {
+	return agent.UpdatedAt != "" &&
+		entry.updatedAt == agent.UpdatedAt &&
+		entry.latestRunID == agent.LatestRunID
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, query url.Values, dest any) error {
@@ -239,11 +318,11 @@ func (c *Client) getJSON(ctx context.Context, path string, query url.Values, des
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg := strings.TrimSpace(string(body))
-		if msg == "" {
-			msg = resp.Status
+		return &APIError{
+			StatusCode: resp.StatusCode,
+			Body:       errorMessage(resp.Status, body),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
-		return &APIError{StatusCode: resp.StatusCode, Body: msg}
 	}
 
 	if dest == nil {
@@ -253,4 +332,43 @@ func (c *Client) getJSON(ctx context.Context, path string, query url.Values, des
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+// errorMessage keeps API error text short and single-line so HTML error pages
+// or large JSON bodies never end up verbatim in alerts.
+func errorMessage(status string, body []byte) string {
+	var parsed struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	msg := ""
+	if json.Unmarshal(body, &parsed) == nil {
+		msg = strings.TrimSpace(parsed.Message)
+		if msg == "" {
+			msg = strings.TrimSpace(parsed.Error)
+		}
+	}
+	if msg == "" {
+		return status
+	}
+	if r := []rune(msg); len(r) > 200 {
+		msg = string(r[:199]) + "…"
+	}
+	return status + ": " + msg
+}
+
+func parseRetryAfter(header string) int {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(header); err == nil && seconds > 0 {
+		return seconds
+	}
+	if t, err := http.ParseTime(header); err == nil {
+		if d := time.Until(t); d > 0 {
+			return int(d.Seconds())
+		}
+	}
+	return 0
 }
