@@ -18,7 +18,7 @@ import (
 const (
 	apiURL        = "https://api.linear.app/graphql"
 	pluginID      = "linear"
-	pluginVersion   = "0.1.1"
+	pluginVersion = "0.1.1"
 )
 
 type linearConfig struct {
@@ -39,6 +39,9 @@ type linearHandler struct {
 	// State tracking for delta detection
 	prevIssueIDs     map[string]prevIssueInfo // id -> previous state
 	prevOverdueCount int
+	seeded           bool // true once a successful snapshot populated prevIssueIDs
+
+	apiURL string // overridable for tests
 }
 
 type prevIssueInfo struct {
@@ -58,8 +61,11 @@ type graphqlResponse struct {
 }
 
 type graphqlError struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
+	Message    string `json:"message"`
+	Type       string `json:"type"`
+	Extensions struct {
+		Code string `json:"code"`
+	} `json:"extensions"`
 }
 
 type graphqlData struct {
@@ -107,6 +113,7 @@ type notificationNode struct {
 	ID        string     `json:"id"`
 	Type      string     `json:"type"`
 	UpdatedAt string     `json:"updatedAt"`
+	ReadAt    *string    `json:"readAt"`
 	Issue     *issueNode `json:"issue"`
 }
 
@@ -121,12 +128,44 @@ type signal struct {
 }
 
 func (p *linearHandler) Initialize(params sdk.InitializeParams) string {
-	if params.Auth != nil {
-		p.token = strings.TrimSpace(params.Auth.AccountID)
-	}
+	p.token = resolveAuthHeader(params)
 	p.config = parseConfig(params.Config)
 	sdk.Log("initialize token=%t assigned=%t mentions=%t triage=%t teamIds=%q", p.token != "", p.config.ShowAssigned, p.config.ShowMentions, p.config.ShowTriage, strings.Join(p.config.TeamIDs, ","))
 	return sdk.HealthOK
+}
+
+// resolveAuthHeader returns the Authorization header value. Linear personal API
+// keys are sent bare, while OAuth access tokens require the "Bearer " prefix.
+// Provider auth records carry the secret in accessToken/apiKey (accountId is a
+// record id); the legacy auth context carries the raw token in accountId.
+func resolveAuthHeader(params sdk.InitializeParams) string {
+	for _, auth := range params.ProviderAuths {
+		if t := strings.TrimSpace(auth.AccessToken); t != "" {
+			return authHeaderValue(t, true)
+		}
+		if t := strings.TrimSpace(auth.APIKey); t != "" {
+			return authHeaderValue(t, false)
+		}
+	}
+	if params.Auth != nil {
+		if t := strings.TrimSpace(params.Auth.AccountID); t != "" {
+			return authHeaderValue(t, false)
+		}
+	}
+	return ""
+}
+
+func authHeaderValue(token string, oauth bool) string {
+	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
+		return token
+	}
+	if strings.HasPrefix(token, "lin_api_") {
+		return token
+	}
+	if oauth || strings.HasPrefix(token, "lin_oauth_") {
+		return "Bearer " + token
+	}
+	return token
 }
 
 func parseConfig(cfg map[string]string) linearConfig {
@@ -307,7 +346,7 @@ func (p *linearHandler) emitDeltaEvents(signals []signal) {
 		}
 	}
 
-	if len(p.prevIssueIDs) > 0 {
+	if p.seeded {
 		// Detect new issues
 		for id, info := range currentIDs {
 			if _, existed := p.prevIssueIDs[id]; !existed {
@@ -365,17 +404,26 @@ func (p *linearHandler) emitDeltaEvents(signals []signal) {
 
 	p.prevIssueIDs = currentIDs
 	p.prevOverdueCount = currentOverdue
+	p.seeded = true
 }
 
 func (p *linearHandler) fetchData() (graphqlData, bool, error) {
 	query, variables := p.buildQuery()
+	if query == "" {
+		// Every source is disabled; an empty selection set is invalid GraphQL.
+		return graphqlData{}, false, nil
+	}
 	body, err := json.Marshal(graphqlRequest{Query: query, Variables: variables})
 	if err != nil {
 		return graphqlData{}, false, err
 	}
 	sdk.Log("graphql query=%s", query)
 
-	req, err := http.NewRequest(http.MethodPost, apiURL, bytes.NewReader(body))
+	endpoint := apiURL
+	if p.apiURL != "" {
+		endpoint = p.apiURL
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return graphqlData{}, false, err
 	}
@@ -390,9 +438,9 @@ func (p *linearHandler) fetchData() (graphqlData, bool, error) {
 	defer resp.Body.Close()
 
 	p.lastHTTPStatus = resp.StatusCode
-	p.lastRetryAfter = httphealth.ParseRetryAfter(resp.Header.Get("Retry-After"))
+	p.lastRetryAfter = retryAfterSeconds(resp.Header)
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return graphqlData{}, false, err
 	}
@@ -404,29 +452,50 @@ func (p *linearHandler) fetchData() (graphqlData, bool, error) {
 		p.lastError = "Linear authentication failed"
 		return graphqlData{}, false, fmt.Errorf("auth required")
 	}
-	if resp.StatusCode >= 400 {
-		p.lastError = extractGraphQLError(data)
-		if p.lastError == "" {
-			p.lastError = fmt.Sprintf("Linear API error (%d)", resp.StatusCode)
-		}
-		return graphqlData{}, false, fmt.Errorf("linear api status %d", resp.StatusCode)
-	}
 
+	// Linear reports rate limits and auth failures as GraphQL errors (often
+	// with HTTP 400), identified by extensions.code.
 	var parsed graphqlResponse
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return graphqlData{}, false, err
-	}
+	parseErr := json.Unmarshal(data, &parsed)
 	if len(parsed.Errors) > 0 {
-		rateLimited := false
 		p.lastError = parsed.Errors[0].Message
 		for _, gqlErr := range parsed.Errors {
-			if strings.Contains(strings.ToLower(gqlErr.Message), "rate") {
-				rateLimited = true
+			code := strings.ToUpper(gqlErr.Extensions.Code)
+			msg := strings.ToLower(gqlErr.Message)
+			if code == "RATELIMITED" || strings.Contains(msg, "rate limit") {
+				p.lastError = "Linear API rate limited"
+				return graphqlData{}, true, fmt.Errorf("rate limited")
+			}
+			if code == "AUTHENTICATION_ERROR" || code == "UNAUTHENTICATED" {
+				p.lastError = "Linear authentication failed"
+				p.lastHTTPStatus = http.StatusUnauthorized
+				return graphqlData{}, false, fmt.Errorf("auth required")
 			}
 		}
-		return graphqlData{}, rateLimited, fmt.Errorf("%s", parsed.Errors[0].Message)
+		return graphqlData{}, false, fmt.Errorf("%s", parsed.Errors[0].Message)
+	}
+	if resp.StatusCode >= 400 {
+		p.lastError = fmt.Sprintf("Linear API error (%d)", resp.StatusCode)
+		return graphqlData{}, false, fmt.Errorf("linear api status %d", resp.StatusCode)
+	}
+	if parseErr != nil {
+		return graphqlData{}, false, parseErr
 	}
 	return parsed.Data, false, nil
+}
+
+// retryAfterSeconds honours Retry-After, falling back to Linear's
+// X-RateLimit-Requests-Reset header (UTC epoch milliseconds).
+func retryAfterSeconds(h http.Header) int {
+	if v := httphealth.ParseRetryAfter(h.Get("Retry-After")); v > 0 {
+		return v
+	}
+	if reset, err := strconv.ParseInt(h.Get("X-RateLimit-Requests-Reset"), 10, 64); err == nil && reset > 0 {
+		if d := time.Until(time.UnixMilli(reset)); d > 0 {
+			return int(d.Seconds()) + 1
+		}
+	}
+	return 0
 }
 
 func (p *linearHandler) buildQuery() (string, map[string]interface{}) {
@@ -442,16 +511,22 @@ func (p *linearHandler) buildQuery() (string, map[string]interface{}) {
 	}
 
 	if p.config.ShowMentions {
-		sections = append(sections, `notifications(first: 10) {
-    nodes { id type updatedAt issue { id identifier title url updatedAt dueDate priority state { name type } team { id name key } } }
+		// issue only exists on IssueNotification, so it must be queried via an
+		// inline fragment; mentions and read state are filtered client-side.
+		sections = append(sections, `notifications(first: 25) {
+    nodes { id type updatedAt readAt ... on IssueNotification { issue { id identifier title url updatedAt dueDate priority state { name type } team { id name key } } } }
   }`)
 	}
 
 	if p.config.ShowTriage && len(p.config.TeamIDs) > 0 {
 		variables["teamIds"] = p.config.TeamIDs
-		sections = append(sections, `triageIssues: issues(first: 10, filter: { assignee: { null: true }, team: { key: { in: $teamIds } } }) {
+		sections = append(sections, `triageIssues: issues(first: 10, filter: { assignee: { null: true }, team: { key: { in: $teamIds } }, state: { type: { nin: ["completed", "canceled"] } } }) {
     nodes { id identifier title url updatedAt dueDate priority state { name type } team { id name key } }
   }`)
+	}
+
+	if len(sections) == 0 {
+		return "", nil
 	}
 
 	variableDecls := []string{}
@@ -468,21 +543,6 @@ func (p *linearHandler) buildQuery() (string, map[string]interface{}) {
 	return query, variables
 }
 
-func extractGraphQLError(data []byte) string {
-	var parsed struct {
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return ""
-	}
-	if len(parsed.Errors) == 0 {
-		return ""
-	}
-	return parsed.Errors[0].Message
-}
-
 func collectSignals(data graphqlData, cfg linearConfig) []signal {
 	result := make([]signal, 0)
 	now := time.Now()
@@ -494,7 +554,7 @@ func collectSignals(data graphqlData, cfg linearConfig) []signal {
 	}
 	if cfg.ShowMentions {
 		for _, note := range data.Notifications.Nodes {
-			if note.Issue == nil {
+			if note.Issue == nil || note.ReadAt != nil || !strings.Contains(strings.ToLower(note.Type), "mention") {
 				continue
 			}
 			result = append(result, signal{kind: "mention", issue: *note.Issue, updatedAt: parseTime(note.UpdatedAt), severity: "warning", detail: "Unread mention", alert: "You have unread Linear mentions", uniqueID: note.ID})
@@ -505,7 +565,7 @@ func collectSignals(data graphqlData, cfg linearConfig) []signal {
 			severity := "info"
 			detail := "Needs triage"
 			alert := ""
-			if issue.Priority >= 3 {
+			if isHighPriority(issue.Priority) {
 				severity = "warning"
 				detail = "High priority unassigned"
 				alert = "High priority Linear issue needs triage"
@@ -570,7 +630,7 @@ func issueUrgency(issue issueNode, now time.Time) (string, string, string) {
 			}
 		}
 	}
-	if issue.Priority >= 3 {
+	if isHighPriority(issue.Priority) {
 		if severity == "info" {
 			severity = "warning"
 		}
@@ -579,11 +639,24 @@ func issueUrgency(issue issueNode, now time.Time) (string, string, string) {
 	return severity, strings.Join(parts, " · "), alert
 }
 
+// Linear priorities: 0 = none, 1 = urgent, 2 = high, 3 = medium, 4 = low.
+func isHighPriority(priority int) bool {
+	return priority == 1 || priority == 2
+}
+
 func priorityLabel(priority int) string {
-	if priority <= 0 {
+	switch priority {
+	case 1:
+		return "Urgent"
+	case 2:
+		return "High priority"
+	case 3:
+		return "Medium priority"
+	case 4:
+		return "Low priority"
+	default:
 		return ""
 	}
-	return fmt.Sprintf("Priority %d", priority)
 }
 
 func toItem(s signal) sdk.Item {
@@ -593,7 +666,7 @@ func toItem(s signal) sdk.Item {
 		Subtitle:  itemSubtitle(s),
 		Detail:    s.detail,
 		Severity:  s.severity,
-		Timestamp: s.issue.UpdatedAt,
+		Timestamp: isoTimestamp(s.issue.UpdatedAt),
 		DeepLink:  s.issue.URL,
 		Actions:   []sdk.Action{{ID: "open", Label: "Open Issue"}},
 	}
@@ -623,11 +696,21 @@ func issueTitle(issue issueNode) string {
 	return issue.Identifier + " " + issue.Title
 }
 
+// isoTimestamp normalises Linear's millisecond timestamps to RFC3339 without
+// fractional seconds, which is what the host's ISO8601 parser accepts.
+func isoTimestamp(raw string) string {
+	t := parseTime(raw)
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 func parseTime(raw string) time.Time {
 	if raw == "" {
 		return time.Time{}
 	}
-	parsed, err := time.Parse(time.RFC3339, raw)
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil {
 		return time.Time{}
 	}
