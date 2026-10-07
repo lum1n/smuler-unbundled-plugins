@@ -2,10 +2,14 @@ package sdk
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lum1n/smuler/plugins/plugindebug"
@@ -52,41 +56,80 @@ func Log(format string, args ...interface{}) {
 }
 
 // Emit sends an unsolicited event notification to the host.
-// Call this from your Handler.GetStatus() implementation.
+// Call this from your Handler.GetStatus() implementation. Safe for concurrent use.
 func Emit(event Event) {
 	if currentPluginID != "" {
 		event.PluginID = currentPluginID
 	}
 	event.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	params := eventParams{Event: event}
-	payload, err := json.Marshal(params)
+	data, err := json.Marshal(rpcNotification{JSONRPC: "2.0", Method: "event", Params: eventParams{Event: event}})
 	if err != nil {
 		Log("json marshal error in Emit: %v", err)
 		return
 	}
-	fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","method":"event","params":%s}`+"\n", string(payload))
+	writeLine(data)
 }
 
 // --- internal ---
 
 var currentPluginID string
 
+// maxLineBytes bounds a single inbound JSON-RPC line. Initialize payloads can
+// carry peer snapshots, so this is far above bufio.Scanner's 64 KiB default.
+const maxLineBytes = 64 * 1024 * 1024
+
+// shutdownGrace bounds how long "shutdown" waits for in-flight handler calls
+// before replying anyway (the host only waits ~2s for the shutdown response).
+var shutdownGrace = 1500 * time.Millisecond
+
+var errLineTooLong = errors.New("json-rpc line exceeds limit")
+
+// stdout is shared by responses and Emit; every line is written atomically
+// under outMu so concurrent writers never interleave.
+var (
+	outMu sync.Mutex
+	out   io.Writer = os.Stdout
+)
+
+func writeLine(data []byte) {
+	line := make([]byte, 0, len(data)+1)
+	line = append(line, data...)
+	line = append(line, '\n')
+	outMu.Lock()
+	defer outMu.Unlock()
+	if _, err := out.Write(line); err != nil {
+		Log("stdout write error: %v", err)
+	}
+}
+
 type eventParams struct {
 	Event Event `json:"event"`
 }
 
+type rpcNotification struct {
+	JSONRPC string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params"`
+}
+
+// rpcRequest keeps the id raw so numeric and string ids are echoed back
+// verbatim; a missing or null id marks a notification (no response).
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
+	ID      json.RawMessage `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params"`
 }
 
+func (r rpcRequest) hasID() bool {
+	return len(r.ID) > 0 && string(r.ID) != "null"
+}
+
 type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  interface{}     `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
 }
 
 type rpcError struct {
@@ -107,17 +150,17 @@ type initPayload struct {
 	Health          string `json:"health"`
 }
 
-func sendResult(id int, result interface{}) {
-	resp := rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
-	data, err := json.Marshal(resp)
+func sendResult(id json.RawMessage, result interface{}) {
+	data, err := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: id, Result: result})
 	if err != nil {
 		Log("json marshal error: %v", err)
+		sendError(id, -32603, "failed to encode result", true, "")
 		return
 	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
+	writeLine(data)
 }
 
-func sendError(id int, code int, message string, retryable bool, suggestedAction string) {
+func sendError(id json.RawMessage, code int, message string, retryable bool, suggestedAction string) {
 	resp := rpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
@@ -132,7 +175,161 @@ func sendError(id int, code int, message string, retryable bool, suggestedAction
 		Log("json marshal error: %v", err)
 		return
 	}
-	fmt.Fprintf(os.Stdout, "%s\n", string(data))
+	writeLine(data)
+}
+
+// readLine returns the next newline-terminated line (without the newline).
+// Lines longer than max are discarded and reported as errLineTooLong so the
+// loop can keep serving subsequent requests instead of dying.
+func readLine(r *bufio.Reader, max int) ([]byte, error) {
+	var buf []byte
+	tooLong := false
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if !tooLong {
+			if len(buf)+len(chunk) > max {
+				tooLong = true
+				buf = nil
+			} else {
+				buf = append(buf, chunk...)
+			}
+		}
+		switch err {
+		case nil:
+			if tooLong {
+				return nil, errLineTooLong
+			}
+			return buf, nil
+		case bufio.ErrBufferFull:
+			continue
+		default:
+			if tooLong {
+				return nil, errLineTooLong
+			}
+			if len(buf) > 0 && err == io.EOF {
+				return buf, nil
+			}
+			return nil, err
+		}
+	}
+}
+
+// server serializes calls into the (non-thread-safe) Handler while the stdin
+// loop keeps reading, so a slow refresh never blocks shutdown, and concurrent
+// getStatus/refresh requests share one in-flight snapshot computation.
+type server struct {
+	handler   Handler
+	handlerMu sync.Mutex
+	initResp  initPayload
+
+	flightMu sync.Mutex
+	flight   *statusFlight
+	wg       sync.WaitGroup
+}
+
+type statusFlight struct {
+	ids []json.RawMessage
+}
+
+// call runs fn under the handler lock, converting a panic into an error.
+func (s *server) call(method string, fn func()) (err error) {
+	s.handlerMu.Lock()
+	defer s.handlerMu.Unlock()
+	defer func() {
+		if r := recover(); r != nil {
+			Log("panic in %s: %v", method, r)
+			err = fmt.Errorf("plugin panic in %s", method)
+		}
+	}()
+	fn()
+	return nil
+}
+
+func (s *server) handleStatus(req rpcRequest) {
+	if !req.hasID() {
+		return
+	}
+	s.flightMu.Lock()
+	if s.flight != nil {
+		s.flight.ids = append(s.flight.ids, req.ID)
+		s.flightMu.Unlock()
+		return
+	}
+	f := &statusFlight{ids: []json.RawMessage{req.ID}}
+	s.flight = f
+	s.flightMu.Unlock()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		var snap Snapshot
+		err := s.call(req.Method, func() { snap = s.handler.GetStatus() })
+
+		s.flightMu.Lock()
+		ids := f.ids
+		s.flight = nil
+		s.flightMu.Unlock()
+
+		for _, id := range ids {
+			if err != nil {
+				sendError(id, -32603, err.Error(), true, "")
+			} else {
+				sendResult(id, snap)
+			}
+		}
+	}()
+}
+
+func (s *server) handleAction(req rpcRequest) {
+	actionID, payload := parsePerformActionParams(req.Params)
+	if actionID == "" {
+		if req.hasID() {
+			sendError(req.ID, -32602, "performAction missing actionId", false, "Retry the action.")
+		}
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		var result ActionResult
+		err := s.call(req.Method, func() {
+			if richer, ok := s.handler.(ActionResultHandler); ok {
+				result = richer.PerformActionResult(actionID, payload)
+			} else {
+				success, data := s.handler.PerformAction(actionID, payload)
+				result = ActionResult{Success: success, Data: data}
+				if !success {
+					result.Error = data
+				}
+			}
+		})
+		if !req.hasID() {
+			return
+		}
+		if err != nil {
+			sendError(req.ID, -32603, err.Error(), true, "")
+			return
+		}
+		sendResult(req.ID, result)
+	}()
+}
+
+// handleShutdown calls Handler.Shutdown once in-flight work finishes, but
+// replies within shutdownGrace even if a handler call is stuck.
+func (s *server) handleShutdown(req rpcRequest) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = s.call(req.Method, s.handler.Shutdown)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownGrace):
+		Log("shutdown: handler busy, replying without waiting")
+	}
+	if req.hasID() {
+		sendResult(req.ID, nil)
+	}
 }
 
 // Run starts the JSON-RPC stdio loop. It blocks until the plugin receives
@@ -140,77 +337,93 @@ func sendError(id int, code int, message string, retryable bool, suggestedAction
 // host during the initialize handshake.
 func Run(pluginID, pluginVersion string, handler Handler) {
 	currentPluginID = pluginID
+	serve(os.Stdin, pluginVersion, handler)
+}
 
-	defer func() {
-		if r := recover(); r != nil {
-			Log("panic: %v", r)
-		}
-	}()
-
-	initResp := initPayload{
-		Type:            "initialized",
-		ProtocolVersion: "0.1.0",
-		PluginVersion:   pluginVersion,
-		Health:          HealthOK,
+func serve(in io.Reader, pluginVersion string, handler Handler) {
+	s := &server{
+		handler: handler,
+		initResp: initPayload{
+			Type:            "initialized",
+			ProtocolVersion: "0.1.0",
+			PluginVersion:   pluginVersion,
+			Health:          HealthOK,
+		},
 	}
 
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(nil, 2*1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+	reader := bufio.NewReaderSize(in, 64*1024)
+	for {
+		raw, err := readLine(reader, maxLineBytes)
+		if err == errLineTooLong {
+			Log("dropping oversized request line (> %d bytes)", maxLineBytes)
+			continue
+		}
+		if err != nil {
+			if err != io.EOF {
+				Log("stdin read error: %v", err)
+			}
+			break
+		}
+		line := bytes.TrimSpace(raw)
+		if len(line) == 0 {
 			continue
 		}
 
 		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
+		if err := json.Unmarshal(line, &req); err != nil {
+			Log("dropping malformed request: %v", err)
 			continue
 		}
 
 		switch req.Method {
 		case "initialize":
+			// Handled inline so later requests observe initialized state.
 			var params InitializeParams
 			if err := json.Unmarshal(req.Params, &params); err == nil {
 				plugindebug.ConfigureFromInitializeConfig(params.Config)
-				initResp.Health = handler.Initialize(params)
-				if initResp.Health == "" {
-					initResp.Health = HealthOK
+				var health string
+				if err := s.call(req.Method, func() { health = handler.Initialize(params) }); err != nil {
+					health = HealthError
 				}
+				if health == "" {
+					health = HealthOK
+				}
+				s.initResp.Health = health
+			} else {
+				Log("initialize params decode failed: %v", err)
 			}
-			sendResult(req.ID, initResp)
+			if req.hasID() {
+				sendResult(req.ID, s.initResp)
+			}
 
 		case "getStatus", "refresh":
-			sendResult(req.ID, handler.GetStatus())
+			s.handleStatus(req)
 
 		case "performAction":
-			actionID, payload := parsePerformActionParams(req.Params)
-			if actionID == "" {
-				sendError(req.ID, -32602, "performAction missing actionId", false, "Retry the action.")
-				continue
-			}
-			if richer, ok := handler.(ActionResultHandler); ok {
-				sendResult(req.ID, richer.PerformActionResult(actionID, payload))
-			} else {
-				success, data := handler.PerformAction(actionID, payload)
-				result := ActionResult{Success: success, Data: data}
-				if !success {
-					result.Error = data
-				}
-				sendResult(req.ID, result)
-			}
+			s.handleAction(req)
+
 		case "shutdown":
-			handler.Shutdown()
-			sendResult(req.ID, nil)
+			s.handleShutdown(req)
 			return
 
 		default:
-			sendError(req.ID, -32601, fmt.Sprintf("unknown method: %s", req.Method), false, "")
+			if req.hasID() {
+				sendError(req.ID, -32601, fmt.Sprintf("unknown method: %s", req.Method), false, "")
+			}
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		Log("stdin scanner error: %v", err)
+	// stdin closed: give in-flight requests a bounded window to finish
+	// writing their responses, without hanging forever on a stuck handler.
+	finished := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		Log("stdin closed with handler calls still running; exiting")
 	}
 }
 

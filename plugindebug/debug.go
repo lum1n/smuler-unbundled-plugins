@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -11,14 +12,15 @@ const (
 	EnvVar    = "SMULER_PLUGIN_DEBUG"
 )
 
-var hostEnabled bool
+// hostEnabled is read from logging goroutines while initialize may update it.
+var hostEnabled atomic.Bool
 
 func ConfigureFromInitializeConfig(config map[string]string) {
 	if config == nil {
-		hostEnabled = false
+		hostEnabled.Store(false)
 		return
 	}
-	hostEnabled = parseTruthy(config[ConfigKey])
+	hostEnabled.Store(parseTruthy(config[ConfigKey]))
 }
 
 func parseTruthy(value string) bool {
@@ -31,7 +33,7 @@ func parseTruthy(value string) bool {
 }
 
 func Enabled() bool {
-	if hostEnabled {
+	if hostEnabled.Load() {
 		return true
 	}
 	return parseTruthy(os.Getenv(EnvVar))
@@ -45,5 +47,5 @@ func Log(prefix, format string, args ...interface{}) {
 }
 
 func Reset() {
-	hostEnabled = false
+	hostEnabled.Store(false)
 }

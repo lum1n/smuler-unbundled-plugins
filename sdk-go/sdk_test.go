@@ -65,8 +65,8 @@ func TestSnapshotRoundtrip(t *testing.T) {
 				Actions:   []Action{{ID: "open", Label: "Open in Browser"}},
 			},
 		},
-		Actions: []Action{},
-		Alerts:  []Alert{{ID: "rate", Severity: SeverityWarning, Message: "Rate limit approaching"}},
+		Actions:      []Action{},
+		Alerts:       []Alert{{ID: "rate", Severity: SeverityWarning, Message: "Rate limit approaching"}},
 		RefreshAfter: 60,
 		Health:       HealthOK,
 	}
@@ -177,8 +177,8 @@ func TestRPCRequestParsing(t *testing.T) {
 		t.Fatalf("unmarshal request: %v", err)
 	}
 
-	if req.ID != 1 {
-		t.Errorf("id: got %d, want 1", req.ID)
+	if string(req.ID) != "1" {
+		t.Errorf("id: got %s, want 1", req.ID)
 	}
 	if req.Method != "getStatus" {
 		t.Errorf("method: got %q, want getStatus", req.Method)
@@ -238,8 +238,8 @@ func TestActionResultWithAIWindow(t *testing.T) {
 		Title:    "Demo",
 		IconHint: "doc.text",
 		Sections: []WindowSection{{
-			ID:    "loading",
-			Title: "Summary",
+			ID:     "loading",
+			Title:  "Summary",
 			Blocks: []WindowBlock{{ID: "generating", Text: "Generating summary...", Style: WindowBlockParagraph}},
 		}},
 	}
@@ -300,7 +300,7 @@ func TestActionAITaskHelpers(t *testing.T) {
 func TestRPCResponseMarshaling(t *testing.T) {
 	resp := rpcResponse{
 		JSONRPC: "2.0",
-		ID:      1,
+		ID:      json.RawMessage("1"),
 		Result: Snapshot{
 			PluginID: "test",
 			State:    StateReady,
