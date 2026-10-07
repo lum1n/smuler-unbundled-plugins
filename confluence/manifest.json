@@ -1,7 +1,7 @@
 {
   "id": "confluence",
   "name": "Confluence",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Recent Confluence activity plus companion/voice search across all spaces for pages and docs",
   "icon": {
     "type": "sfSymbol",
