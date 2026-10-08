@@ -483,8 +483,10 @@ submit_registry() {
   GH_TOKEN="$submit_token" git -C "$tmp" push -u origin "HEAD:refs/heads/${branch}"
   (
     cd "$tmp"
+    # --head is required: with --repo, gh does not infer the pushed branch.
     GH_TOKEN="$submit_token" gh pr create \
       --repo "$REGISTRY_REPO" \
+      --head "$branch" \
       --title "Submit first-party plugins (${TAG:-batch})" \
       --body "$(cat <<EOF
 Automated batch submission from \`publish-registry-plugins.sh\`.
