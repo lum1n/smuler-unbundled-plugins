@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -53,7 +54,9 @@ func newClaudeTestEnv(t *testing.T) *claudeTestEnv {
 	claudeHomeDir = env.home
 	claudeKeychainReader = func(context.Context) ([]byte, error) { return nil, errClaudeNoCredentials }
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("SMULER_CLAUDE_USER_AGENT", "")
 	t.Cleanup(func() { claudeUsageURL, claudeHomeDir, claudeKeychainReader = oldURL, oldHome, oldKeychain })
+	resetClaudeUserAgent(t, func() string { return "2.1.80" })
 	return env
 }
 
@@ -126,6 +129,9 @@ func TestClaudeFetchUsesLocalCredentialsAndHeaders(t *testing.T) {
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer local-token" {
 			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get("User-Agent"); got != "claude-cli/2.1.80 (external, cli)" {
+			t.Errorf("User-Agent = %q", got)
 		}
 		if got := r.Header.Get("anthropic-beta"); got != "oauth-2025-04-20" {
 			t.Errorf("anthropic-beta = %q", got)
@@ -349,5 +355,61 @@ func TestGeminiExpiryDateMillis(t *testing.T) {
 	}
 	if !creds.ExpiryDate.Equal(time.UnixMilli(1760000000000).UTC()) {
 		t.Fatalf("expiry = %v", creds.ExpiryDate)
+	}
+}
+
+func TestParseClaudeCLIVersion(t *testing.T) {
+	cases := map[string]string{
+		"2.1.80 (Claude Code)\n": "2.1.80",
+		"v2.0.14":                "2.0.14",
+		"":                       "",
+		"claude: command failed": "",
+		"42":                     "",
+	}
+	for in, want := range cases {
+		if got := parseClaudeCLIVersion(in); got != want {
+			t.Errorf("parseClaudeCLIVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func resetClaudeUserAgent(t *testing.T, probe func() string) {
+	t.Helper()
+	oldProbe := claudeVersionProbe
+	claudeVersionProbe = probe
+	claudeUserAgentOnce = sync.Once{}
+	claudeUserAgentValue = ""
+	t.Cleanup(func() {
+		claudeVersionProbe = oldProbe
+		claudeUserAgentOnce = sync.Once{}
+		claudeUserAgentValue = ""
+	})
+}
+
+func TestClaudeUserAgentUsesInstalledCLIVersion(t *testing.T) {
+	t.Setenv("SMULER_CLAUDE_USER_AGENT", "")
+	resetClaudeUserAgent(t, func() string { return "2.3.4" })
+	if got := claudeUserAgent(); got != "claude-cli/2.3.4 (external, cli)" {
+		t.Fatalf("user agent = %q", got)
+	}
+}
+
+func TestClaudeUserAgentFallsBackAndHonoursOverride(t *testing.T) {
+	t.Setenv("SMULER_CLAUDE_USER_AGENT", "")
+	resetClaudeUserAgent(t, func() string { return "" })
+	if got := claudeUserAgent(); got != "claude-cli/"+claudeFallbackCLIVersion+" (external, cli)" {
+		t.Fatalf("fallback user agent = %q", got)
+	}
+
+	t.Setenv("SMULER_CLAUDE_USER_AGENT", "custom/1.0")
+	resetClaudeUserAgent(t, func() string { return "9.9.9" })
+	if got := claudeUserAgent(); got != "custom/1.0" {
+		t.Fatalf("override user agent = %q", got)
+	}
+}
+
+func TestClaudeDefaultUsageURLRequestsCedarEmber(t *testing.T) {
+	if !strings.Contains(claudeDefaultUsageURL, "cedar_ember=1") {
+		t.Fatalf("usage URL %q missing cedar_ember=1", claudeDefaultUsageURL)
 	}
 }
