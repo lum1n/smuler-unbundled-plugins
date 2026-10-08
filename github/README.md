@@ -14,7 +14,7 @@ First-party **registry** plugin for GitHub workflow signals (not bundled with th
 Long-lived JSON-RPC process over stdio. Written in Go.
 
 ### Initialize
-Receives the GitHub token via `params.providerAuths[].accountId` (populated from macOS Keychain by the host).
+Receives the GitHub token via `params.providerAuths[].accessToken` / `apiKey`, falling back to the legacy `params.auth.accountId` (populated from macOS Keychain by the host).
 
 ### getStatus / refresh
 Calls `GET /search/issues?q=is:pr+is:open+review-requested:@me` to find PRs awaiting review. Reports:

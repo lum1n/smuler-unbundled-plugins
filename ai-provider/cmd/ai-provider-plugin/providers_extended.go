@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -20,7 +21,8 @@ var devinOrgName = ""
 
 func providerRequiresHostAuth(providerID string) bool {
 	switch providerID {
-	case "gemini", "kiro":
+	case "gemini", "kiro", "claude":
+		// These fall back to local CLI credentials when no host secret is set.
 		return false
 	default:
 		return true
@@ -54,6 +56,10 @@ func geminiLoadOAuthCreds() (geminiOAuthCreds, error) {
 	if err != nil {
 		return geminiOAuthCreds{}, err
 	}
+	return geminiParseOAuthCreds(body)
+}
+
+func geminiParseOAuthCreds(body []byte) (geminiOAuthCreds, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return geminiOAuthCreds{}, err
@@ -68,8 +74,18 @@ func geminiLoadOAuthCreds() (geminiOAuthCreds, error) {
 	if v, ok := raw["id_token"].(string); ok {
 		creds.IDToken = strings.TrimSpace(v)
 	}
-	if v, ok := raw["expiry_date"].(string); ok {
-		creds.ExpiryDate = parseFlexibleTime(v)
+	// gemini-cli writes expiry_date as epoch milliseconds (a JSON number).
+	switch v := raw["expiry_date"].(type) {
+	case float64:
+		if v > 0 {
+			creds.ExpiryDate = time.UnixMilli(int64(v)).UTC()
+		}
+	case string:
+		if ms, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && ms > 0 {
+			creds.ExpiryDate = time.UnixMilli(ms).UTC()
+		} else {
+			creds.ExpiryDate = parseFlexibleTime(v)
+		}
 	}
 	return creds, nil
 }
@@ -103,11 +119,13 @@ func geminiRefreshAccessToken(ctx context.Context, refreshToken string) (string,
 	if !ok {
 		return "", fmt.Errorf("Gemini CLI OAuth configuration not found")
 	}
-	form := fmt.Sprintf(
-		"client_id=%s&client_secret=%s&refresh_token=%s&grant_type=refresh_token",
-		clientID, clientSecret, refreshToken,
-	)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form))
+	form := url.Values{
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"refresh_token": {refreshToken},
+		"grant_type":    {"refresh_token"},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
 	}
@@ -592,9 +610,9 @@ func (p *augmentProvider) Fetch(ctx context.Context, auth AuthContext) (Provider
 		return ProviderStatus{}, formatHTTPError("Augment", creditsStatus, creditsBody)
 	}
 	var credits struct {
-		UsageUnitsRemaining              *float64 `json:"usageUnitsRemaining"`
+		UsageUnitsRemaining                *float64 `json:"usageUnitsRemaining"`
 		UsageUnitsConsumedThisBillingCycle *float64 `json:"usageUnitsConsumedThisBillingCycle"`
-		UsageUnitsAvailable              *float64 `json:"usageUnitsAvailable"`
+		UsageUnitsAvailable                *float64 `json:"usageUnitsAvailable"`
 	}
 	if err := json.Unmarshal(creditsBody, &credits); err != nil {
 		return ProviderStatus{}, fmt.Errorf("Augment parse error: %w", err)

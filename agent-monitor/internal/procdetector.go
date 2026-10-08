@@ -2,11 +2,11 @@ package internal
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,6 +17,9 @@ type ProcDetector struct {
 	interval time.Duration
 	done     chan struct{}
 	tracked  map[string]bool
+
+	startOnce sync.Once
+	stopOnce  sync.Once
 }
 
 // NewProcDetector creates a process detector with the default agent registry.
@@ -24,14 +27,14 @@ func NewProcDetector(store *AgentStore, interval time.Duration) *ProcDetector {
 	return &ProcDetector{
 		store: store,
 		execs: map[string]string{
-			"archer":        "archer",
-			"claude":        "claude",
-			"opencode":      "opencode",
-			"codex":         "codex",
-			"pi":            "pi",
-			"aider":         "aider",
-			"cursor":        "cursor",
-			"cursor-agent":  "cursor",
+			"archer":       "archer",
+			"claude":       "claude",
+			"opencode":     "opencode",
+			"codex":        "codex",
+			"pi":           "pi",
+			"aider":        "aider",
+			"cursor":       "cursor",
+			"cursor-agent": "cursor",
 		},
 		interval: interval,
 		done:     make(chan struct{}),
@@ -39,11 +42,22 @@ func NewProcDetector(store *AgentStore, interval time.Duration) *ProcDetector {
 	}
 }
 
-// Start begins the polling loop.
-func (pd *ProcDetector) Start() { go pd.pollLoop() }
+// SetInterval changes the polling interval; it only takes effect before Start.
+func (pd *ProcDetector) SetInterval(d time.Duration) {
+	if d > 0 {
+		pd.interval = d
+	}
+}
 
-// Stop terminates the polling loop.
-func (pd *ProcDetector) Stop() { close(pd.done) }
+// Start begins the polling loop. Repeated calls are no-ops.
+func (pd *ProcDetector) Start() { pd.startOnce.Do(func() { go pd.pollLoop() }) }
+
+// Stop terminates the polling loop. Safe to call more than once.
+func (pd *ProcDetector) Stop() { pd.stopOnce.Do(func() { close(pd.done) }) }
+
+// orphanGrace is how long a hook-created session whose process has exited
+// is kept before it is dropped.
+const orphanGrace = 30 * time.Second
 
 func (pd *ProcDetector) pollLoop() {
 	ticker := time.NewTicker(pd.interval)
@@ -80,7 +94,28 @@ func (pd *ProcDetector) scan() {
 		}
 	}
 
+	pd.removeOrphans(seen)
 	pd.store.RemoveCompletedOlderThan(time.Now().UnixMilli() - 60000)
+}
+
+// removeOrphans drops non-terminal sessions created by hooks (never matched
+// by the process scan) whose process is gone. Without this they stayed in
+// the store, and the menubar, forever.
+func (pd *ProcDetector) removeOrphans(seen map[string]bool) {
+	cutoff := time.Now().Add(-orphanGrace).UnixMilli()
+	for _, a := range pd.store.List() {
+		if seen[a.ID] || pd.tracked[a.ID] || a.IsTerminalState() || a.UpdatedAt > cutoff {
+			continue
+		}
+		// tmux sessions are owned by the agent-watcher, which reports their
+		// lifecycle (and may have no PID for unbound panes).
+		if a.Source == SourceTmux {
+			continue
+		}
+		if a.PID <= 0 || !processAlive(a.PID) {
+			pd.store.Remove(a.ID)
+		}
+	}
 }
 
 func (pd *ProcDetector) matchAndRecord(args []string, pid int, ppid int, seen map[string]bool) {
@@ -151,7 +186,7 @@ func (pd *ProcDetector) matchAndRecord(args []string, pid int, ppid int, seen ma
 }
 
 func (pd *ProcDetector) scanPS(seen map[string]bool) {
-	out, err := exec.Command("ps", "-Ao", "pid=,ppid=,args=").Output()
+	out, err := commandOutput("ps", "-Ao", "pid=,ppid=,args=")
 	if err != nil {
 		return
 	}

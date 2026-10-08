@@ -2,8 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lum1n/smuler/plugins/sdk-go"
 )
@@ -175,8 +179,11 @@ func tryTeamsDir(dir string) (string, string) {
 }
 
 func findLogFile(dir string) string {
-	// First try the find command for speed on large dirs
-	out, err := exec.Command("find", dir, "-maxdepth", "5", "-type", "f",
+	// First try the find command for speed on large dirs. Bounded so a huge
+	// container tree cannot stall the initialize handshake.
+	ctx, cancel := context.WithTimeout(context.Background(), findTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "find", dir, "-maxdepth", "5", "-type", "f",
 		"(", "-name", "*log*", "-o", "-name", "*.txt", "-o", "-name", "*.log", ")").Output()
 	if err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -184,13 +191,23 @@ func findLogFile(dir string) string {
 				return line
 			}
 		}
+		return ""
+	}
+	if ctx.Err() != nil {
+		return ""
 	}
 
 	// Fallback: walk manually, skip LevelDB companion files
 	var found string
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || found != "" {
-			return filepath.SkipDir
+		if found != "" {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			if info != nil && info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if info.IsDir() {
 			return nil
@@ -201,12 +218,15 @@ func findLogFile(dir string) string {
 		name := strings.ToLower(info.Name())
 		if strings.Contains(name, "log") || strings.HasSuffix(name, ".txt") || strings.HasSuffix(name, ".log") {
 			found = path
-			return filepath.SkipDir
+			return filepath.SkipAll
 		}
 		return nil
 	})
 	return found
 }
+
+// findTimeout bounds each external `find` used for log discovery.
+const findTimeout = 5 * time.Second
 
 func isLevelDBFile(path string) bool {
 	name := filepath.Base(path)
@@ -306,7 +326,7 @@ func (h *handler) GetStatus() sdk.Snapshot {
 				Severity: sdk.SeverityInfo,
 				Actions:  []sdk.Action{{ID: "launch", Label: "Open Teams"}},
 			}},
-			RefreshAfter: 10,
+			RefreshAfter: h.refreshSec,
 			Health:       sdk.HealthOK,
 		}
 	}
@@ -343,7 +363,7 @@ func (h *handler) buildSnapshot(logLines []string) sdk.Snapshot {
 	events := parseEvents(logLines)
 	items := buildItems(events, h)
 
-	if h.lastKnownURL != "" {
+	if h.lastKnownURL == "" {
 		for _, e := range events {
 			if e.meetupURL != "" {
 				h.lastKnownURL = e.meetupURL
@@ -430,15 +450,17 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 		if err := exec.Command("open", "-a", "Microsoft Teams").Run(); err != nil {
 			return false, fmt.Sprintf("failed to launch Teams: %v", err)
 		}
-		if id == "open-teams" {
-			exec.Command("open", "-a", "Microsoft Teams").Start()
-		}
 		return true, ""
 
 	case strings.HasPrefix(id, "join-"):
 		url := strings.TrimPrefix(id, "join-")
 		if url == "" {
 			return false, "no meeting URL"
+		}
+		// Only ever hand Teams meeting links to `open`; the action id is
+		// caller-supplied and must not become an arbitrary URL/file opener.
+		if reMeetupURL.FindString(url) != url {
+			return false, "invalid meeting URL"
 		}
 		if err := exec.Command("open", url).Run(); err != nil {
 			return false, fmt.Sprintf("failed to join: %v", err)
@@ -528,7 +550,8 @@ func (h *handler) readLogStream() []string {
 	return recent
 }
 
-// log stream timestamp format: 2026-06-30 14:20:45.123456+0200
+// log stream timestamps are local wall-clock time, e.g.
+// "2026-06-30 14:20:45.123456+0200" (default) or "2026-06-30 14:20:45.123" (compact).
 var reLogStreamTS = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)`)
 
 func extractLogStreamTimestamp(line string) time.Time {
@@ -536,11 +559,15 @@ func extractLogStreamTimestamp(line string) time.Time {
 	if len(m) < 2 {
 		return time.Time{}
 	}
-	t, _ := time.Parse("2006-01-02 15:04:05.000000", m[1])
+	// Variable-width fraction (compact style prints milliseconds) and local
+	// zone: parsing as UTC shifted every line by the UTC offset, so the 30s
+	// window either kept stale lines or dropped all of them.
+	t, _ := time.ParseInLocation("2006-01-02 15:04:05.999999999", m[1], time.Local)
 	return t
 }
 
 type logEvent struct {
+	id        string
 	timestamp string
 	message   string
 	isMention bool
@@ -556,7 +583,7 @@ func buildItems(events []logEvent, h *handler) []sdk.Item {
 		switch {
 		case e.callState == "ringing":
 			items = append(items, sdk.Item{
-				ID:        "call-ringing-" + e.timestamp,
+				ID:        "call-ringing-" + e.id,
 				Title:     "Incoming call",
 				Subtitle:  "Teams call ringing",
 				Severity:  sdk.SeverityWarning,
@@ -565,7 +592,7 @@ func buildItems(events []logEvent, h *handler) []sdk.Item {
 			})
 		case e.callState == "connected":
 			items = append(items, sdk.Item{
-				ID:        "call-active-" + e.timestamp,
+				ID:        "call-active-" + e.id,
 				Title:     "In call",
 				Subtitle:  "Call in progress",
 				Severity:  sdk.SeverityInfo,
@@ -578,7 +605,7 @@ func buildItems(events []logEvent, h *handler) []sdk.Item {
 				title = trunc(e.chatText, 80)
 			}
 			items = append(items, sdk.Item{
-				ID:        "meeting-" + e.timestamp,
+				ID:        "meeting-" + e.id,
 				Title:     title,
 				Subtitle:  "Click Join to enter",
 				Severity:  sdk.SeverityInfo,
@@ -594,7 +621,7 @@ func buildItems(events []logEvent, h *handler) []sdk.Item {
 				title = trunc(e.chatText, 80)
 			}
 			items = append(items, sdk.Item{
-				ID:        "mention-" + e.timestamp,
+				ID:        "mention-" + e.id,
 				Title:     title,
 				Subtitle:  "@mention in Teams",
 				Severity:  sdk.SeverityWarning,
@@ -606,7 +633,7 @@ func buildItems(events []logEvent, h *handler) []sdk.Item {
 			})
 		case e.isMeeting:
 			items = append(items, sdk.Item{
-				ID:        "meeting-start-" + e.timestamp,
+				ID:        "meeting-start-" + e.id,
 				Title:     "Meeting started",
 				Subtitle:  e.chatText,
 				Severity:  sdk.SeverityInfo,
@@ -615,7 +642,7 @@ func buildItems(events []logEvent, h *handler) []sdk.Item {
 			})
 		case e.chatText != "":
 			items = append(items, sdk.Item{
-				ID:        "msg-" + e.timestamp,
+				ID:        "msg-" + e.id,
 				Title:     trunc(e.chatText, 80),
 				Subtitle:  "New message",
 				Severity:  sdk.SeverityInfo,
@@ -650,16 +677,46 @@ func tailLog(logPath string, maxLines int) ([]string, error) {
 	}
 	defer file.Close()
 
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(nil, 2*1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
+	// Read backwards from EOF in chunks until we have maxLines lines, instead
+	// of scanning the whole (often hundreds of MB) log on every refresh.
+	st, err := file.Stat()
+	if err != nil {
 		return nil, err
 	}
+	const chunk = 64 * 1024
+	maxBytes := int64(maxLines) * 4096 // bound pathological long-line logs
+	end := st.Size()
+	var buf []byte
+	pos := end
+	for pos > 0 && end-pos < maxBytes && bytes.Count(buf, []byte{'\n'}) <= maxLines {
+		n := int64(chunk)
+		if pos < n {
+			n = pos
+		}
+		pos -= n
+		part := make([]byte, n)
+		if _, err := file.ReadAt(part, pos); err != nil && err != io.EOF {
+			return nil, err
+		}
+		buf = append(part, buf...)
+	}
+	if pos > 0 {
+		// Drop the partial first line.
+		if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+			buf = buf[i+1:]
+		} else {
+			buf = nil
+		}
+	}
 
+	text := strings.TrimRight(string(buf), "\r\n")
+	if text == "" {
+		return nil, nil
+	}
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimSuffix(l, "\r")
+	}
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]
 	}
@@ -672,13 +729,9 @@ func parseEvents(lines []string) []logEvent {
 
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
-		ts := extractTimestamp(line)
-		if ts == "" {
-			ts = time.Now().UTC().Format(time.RFC3339)
-		}
-
 		var event logEvent
-		event.timestamp = ts
+		event.timestamp = extractTimestamp(line)
+		event.id = lineID(line)
 
 		if reMention.MatchString(line) {
 			event.isMention = true
@@ -710,7 +763,10 @@ func parseEvents(lines []string) []logEvent {
 		}
 
 		if event.isMention || event.meetupURL != "" || event.callState != "" || event.chatText != "" {
-			key := event.timestamp + fmt.Sprintf("%v%v%v", event.isMention, event.meetupURL, event.callState)
+			key := event.timestamp + fmt.Sprintf("%v%v%v%v", event.isMention, event.meetupURL, event.callState, event.chatText)
+			if event.timestamp == "" {
+				key = event.id
+			}
 			if !seen[key] {
 				seen[key] = true
 				events = append(events, event)
@@ -725,12 +781,27 @@ func parseEvents(lines []string) []logEvent {
 	return events
 }
 
+// extractTimestamp returns the line's timestamp as RFC 3339 (the host expects
+// ISO 8601), interpreting the zone-less log stamp as local time. Lines without
+// a stamp get "" rather than "now", which made every refresh look new.
 func extractTimestamp(line string) string {
 	m := reTimestamp.FindStringSubmatch(line)
-	if len(m) > 1 {
-		return m[1]
+	if len(m) < 2 {
+		return ""
 	}
-	return ""
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", strings.Replace(m[1], "T", " ", 1), time.Local)
+	if err != nil {
+		return ""
+	}
+	return t.Format(time.RFC3339)
+}
+
+// lineID derives a stable item id from the raw log line so the same event
+// keeps its id across refreshes (and distinct events in the same second differ).
+func lineID(line string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(line))
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 func extractText(line string) string {
@@ -748,17 +819,25 @@ func extractText(line string) string {
 	if strings.HasPrefix(rest, "\\\"") || strings.HasPrefix(rest, `\"`) {
 		rest = rest[2:]
 	}
-	if len(rest) > 200 {
-		rest = rest[:200]
-	}
-	return rest
+	return truncBytes(rest, 200)
 }
 
 func trunc(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return truncBytes(s, n) + "..."
+}
+
+// truncBytes cuts s to at most n bytes without splitting a UTF-8 sequence.
+func truncBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 func main() {

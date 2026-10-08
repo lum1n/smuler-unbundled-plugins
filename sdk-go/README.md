@@ -23,6 +23,12 @@ func main() {
 }
 ```
 
+Handler methods are never called concurrently, so handlers need no locking. The SDK keeps
+reading stdin while a call runs: overlapping `getStatus`/`refresh` requests share one
+`GetStatus()` call, and `shutdown` replies within ~1.5s even if a refresh is stuck. Request
+ids are echoed back verbatim (numeric or string); requests without an id get no response.
+Still bound your own I/O (e.g. `exec.CommandContext` with a timeout).
+
 Declare `"actions"` in `manifest.json` capabilities when you handle `performAction`.
 Declare `"windows"` when any action may return a host-rendered window.
 

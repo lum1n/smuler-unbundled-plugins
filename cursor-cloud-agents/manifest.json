@@ -1,7 +1,7 @@
 {
   "id": "cursor-cloud-agents",
   "name": "Cursor Cloud Agents",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Monitor Cursor cloud agents — status, repos, runs, PRs, and token usage",
   "executable": "bin/cursor-cloud-agents-plugin",
   "icon": { "type": "sfSymbol", "value": "cloud" },

@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,9 +20,22 @@ import (
 
 const (
 	pluginID      = "bitbucket"
-	pluginVersion   = "0.1.3"
+	pluginVersion = "0.1.3"
 	cloudAPIBase  = "https://api.bitbucket.org/2.0"
 	cloudWebBase  = "https://bitbucket.org"
+	// Browser session cookies are scoped to bitbucket.org, not
+	// api.bitbucket.org; the web app's same-origin API proxy accepts them.
+	cloudCookieAPIBase = "https://bitbucket.org/!api/2.0"
+
+	// maxConcurrentRequests bounds per-repo / per-PR fan-out so large
+	// workspaces don't trip Bitbucket's rate limiter.
+	maxConcurrentRequests = 6
+	// repoCacheTTL controls how often the repo list and current user are
+	// re-fetched; they rarely change and cost several paginated requests.
+	repoCacheTTL = 10 * time.Minute
+	// maxErrorBodyLen caps how much of an error response body is kept for
+	// alerts and debug logs.
+	maxErrorBodyLen = 200
 )
 
 type apiHTTPError struct {
@@ -30,7 +45,36 @@ type apiHTTPError struct {
 }
 
 func (e *apiHTTPError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("HTTP %d", e.StatusCode)
+	}
 	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+// errorSnippet returns a short, single-line excerpt of a response body for
+// error messages; full bodies are never surfaced or logged.
+func errorSnippet(body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	return truncate(s, maxErrorBodyLen)
+}
+
+// isLoginPage reports whether a response is an HTML page (typically a
+// redirect to the Atlassian login screen after a session cookie expired)
+// rather than an API payload.
+func isLoginPage(resp *http.Response) bool {
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") {
+		return true
+	}
+	if resp.Request != nil && resp.Request.URL != nil {
+		u := resp.Request.URL
+		host := strings.ToLower(u.Host)
+		path := strings.ToLower(u.Path)
+		if host == "id.atlassian.com" || strings.Contains(path, "/login") || strings.Contains(path, "/account/signin") {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Common API types (normalized; both Cloud and Server map into these) ---
@@ -319,8 +363,11 @@ type bitbucketPlugin struct {
 	serverMode   bool
 	workspace    string
 	currentUser  *bbUser
+	userFetched  time.Time
+	repos        []bbRepo
+	reposFetched time.Time
 	prevPRStates map[string]prStateInfo
-	prCache      map[int]bbPR // PR ID -> metadata for getMRDiff lookups
+	prCache      map[string]bbPR // prKey -> metadata for getMRDiff lookups
 }
 
 func (p *bitbucketPlugin) resolveBases() {
@@ -330,15 +377,55 @@ func (p *bitbucketPlugin) resolveBases() {
 		p.serverMode = true
 	} else {
 		p.apiBase = cloudAPIBase
+		if p.auth.Kind == "browser_import" {
+			p.apiBase = cloudCookieAPIBase
+		}
 		p.webBase = cloudWebBase
 		p.serverMode = false
 	}
 }
 
+// invalidateCaches drops cached user/repo data so the next refresh
+// re-validates credentials from scratch.
+func (p *bitbucketPlugin) invalidateCaches() {
+	p.currentUser = nil
+	p.userFetched = time.Time{}
+	p.repos = nil
+	p.reposFetched = time.Time{}
+}
+
+// prKey uniquely identifies a PR within a workspace. PR numbers are only
+// unique per repository, so the repo slug must be part of the key.
+func prKey(pr bbPR) string {
+	return fmt.Sprintf("%s#%d", pr.RepoSlug, pr.ID)
+}
+
+// lookupCachedPR resolves an item id ("repo#123", or a bare "123" when the
+// number is unambiguous) to a cached PR.
+func (p *bitbucketPlugin) lookupCachedPR(id string) (bbPR, bool) {
+	if pr, ok := p.prCache[id]; ok {
+		return pr, true
+	}
+	n, err := strconv.Atoi(id)
+	if err != nil {
+		return bbPR{}, false
+	}
+	var found bbPR
+	matches := 0
+	for _, pr := range p.prCache {
+		if pr.ID == n {
+			found = pr
+			matches++
+		}
+	}
+	return found, matches == 1
+}
+
 func (p *bitbucketPlugin) Initialize(params sdk.InitializeParams) string {
 	p.config = parseConfig(params.Config)
 	p.workspace = strings.TrimSpace(p.config.Workspace)
-	p.resolveBases()
+	p.auth = bitbucketAuth{}
+	p.invalidateCaches()
 
 	for _, pa := range params.ProviderAuths {
 		switch pa.Kind {
@@ -359,6 +446,8 @@ func (p *bitbucketPlugin) Initialize(params sdk.InitializeParams) string {
 			}
 		}
 	}
+
+	p.resolveBases()
 
 	// In server mode, derive username from config or from app password
 	if p.serverMode && p.config.Username == "" {
@@ -407,21 +496,13 @@ func (p *bitbucketPlugin) PerformActionResult(id string, params map[string]strin
 		if idStr == "" {
 			return sdk.ActionFail("missing id payload")
 		}
-		prID, err := strconv.Atoi(idStr)
-		if err != nil {
-			return sdk.ActionFail("invalid id payload")
-		}
-		return p.getMRDiff(prID)
+		return p.getMRDiff(idStr)
 	case "summarize":
 		idStr := strings.TrimSpace(params["id"])
 		if idStr == "" {
 			return sdk.ActionFail("missing id payload")
 		}
-		prID, err := strconv.Atoi(idStr)
-		if err != nil {
-			return sdk.ActionFail("invalid id payload")
-		}
-		return p.summarizePR(prID)
+		return p.summarizePR(idStr)
 	case "searchPRs":
 		query := strings.TrimSpace(params["query"])
 		if query == "" {
@@ -531,17 +612,17 @@ func (p *bitbucketPlugin) formatPRDetails(pr bbPR, comments, diffStat []string) 
 	return sdk.ActionOK(strings.Join(lines, "\n"))
 }
 
-func (p *bitbucketPlugin) getMRDiff(id int) sdk.ActionResult {
-	pr, ok := p.prCache[id]
+func (p *bitbucketPlugin) getMRDiff(id string) sdk.ActionResult {
+	pr, ok := p.lookupCachedPR(id)
 	if !ok {
-		return sdk.ActionFail(fmt.Sprintf("PR %d not found in cache", id))
+		return sdk.ActionFail(fmt.Sprintf("PR %s not found in cache", id))
 	}
 
 	var url string
 	if p.serverMode {
-		url = fmt.Sprintf("%s/projects/%s/repos/%s/pull-requests/%d/diff", p.apiBase, p.workspace, pr.RepoSlug, id)
+		url = fmt.Sprintf("%s/projects/%s/repos/%s/pull-requests/%d/diff", p.apiBase, p.workspace, pr.RepoSlug, pr.ID)
 	} else {
-		url = fmt.Sprintf("%s/repositories/%s/%s/pullrequests/%d/diff", p.apiBase, p.workspace, pr.RepoSlug, id)
+		url = fmt.Sprintf("%s/repositories/%s/%s/pullrequests/%d/diff", p.apiBase, p.workspace, pr.RepoSlug, pr.ID)
 	}
 
 	diff, err := p.fetchRaw(url)
@@ -551,10 +632,10 @@ func (p *bitbucketPlugin) getMRDiff(id int) sdk.ActionResult {
 	return sdk.ActionOK(diff)
 }
 
-func (p *bitbucketPlugin) summarizePR(id int) sdk.ActionResult {
-	pr, ok := p.prCache[id]
+func (p *bitbucketPlugin) summarizePR(id string) sdk.ActionResult {
+	pr, ok := p.lookupCachedPR(id)
 	if !ok {
-		return sdk.ActionFail(fmt.Sprintf("PR %d not found in cache", id))
+		return sdk.ActionFail(fmt.Sprintf("PR %s not found in cache", id))
 	}
 
 	diffResult := p.getMRDiff(id)
@@ -570,10 +651,10 @@ func (p *bitbucketPlugin) summarizePR(id int) sdk.ActionResult {
 		title = pr.Summary
 	}
 	if title == "" {
-		title = fmt.Sprintf("PR #%d", id)
+		title = fmt.Sprintf("PR #%d", pr.ID)
 	}
 	return sdk.ActionAITask(sdk.AIWindowOpts{
-		ID:       fmt.Sprintf("bitbucket.summarize.%d", id),
+		ID:       fmt.Sprintf("bitbucket.summarize.%s.%d", pr.RepoSlug, pr.ID),
 		Title:    title,
 		Subtitle: "Bitbucket",
 		IconHint: "arrow.triangle.pull",
@@ -593,13 +674,20 @@ func (p *bitbucketPlugin) fetchRaw(urlStr string) (string, error) {
 		return "", fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return "", &apiHTTPError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After")),
+			Body:       errorSnippet(body),
+		}
+	}
+	if isLoginPage(resp) {
+		return "", &apiHTTPError{StatusCode: http.StatusUnauthorized, Body: "session expired (redirected to login page)"}
 	}
 	return string(body), nil
 }
 
 func (p *bitbucketPlugin) searchPRs(query string) sdk.ActionResult {
-	repos, err := p.fetchRepos()
+	repos, err := p.cachedRepos()
 	if err != nil {
 		return sdk.ActionFail(err.Error())
 	}
@@ -670,12 +758,17 @@ func (p *bitbucketPlugin) buildSnapshot() sdk.Snapshot {
 		}
 	}
 
-	user, err := p.fetchCurrentUser()
-	if err != nil {
-		sdk.Log("fetchCurrentUser error: %v", err)
-		return p.snapshotFromAPIError("Auth err", err)
+	user := p.currentUser
+	if user == nil || time.Since(p.userFetched) > repoCacheTTL {
+		fetched, err := p.fetchCurrentUser()
+		if err != nil {
+			sdk.Log("fetchCurrentUser error: %v", err)
+			return p.snapshotFromAPIError("Auth err", err)
+		}
+		user = fetched
+		p.currentUser = user
+		p.userFetched = time.Now()
 	}
-	p.currentUser = user
 
 	if user.Username == "" {
 		return sdk.Snapshot{
@@ -690,7 +783,7 @@ func (p *bitbucketPlugin) buildSnapshot() sdk.Snapshot {
 		}
 	}
 
-	repos, err := p.fetchRepos()
+	repos, err := p.cachedRepos()
 	if err != nil {
 		sdk.Log("fetchRepos error: %v", err)
 		return p.snapshotFromAPIError("API err", err)
@@ -711,23 +804,24 @@ func (p *bitbucketPlugin) buildSnapshot() sdk.Snapshot {
 	sort.Slice(filtered, func(i, j int) bool {
 		return filtered[i].UpdatedOn > filtered[j].UpdatedOn
 	})
+	totalMatching := len(filtered)
 	if len(filtered) > p.config.MaxPRs {
 		filtered = filtered[:p.config.MaxPRs]
 	}
 
-	prStatuses := make(map[int][]bbCommitStatus)
+	prStatuses := make(map[string][]bbCommitStatus)
 	if p.config.ShowPipelines {
 		prStatuses = p.fetchBuildStatuses(filtered)
 	}
 
 	items := p.buildItems(filtered, prStatuses)
 	alerts := p.buildAlerts(filtered, prStatuses)
-	summary := p.buildSummary(items, len(allPRs))
+	summary := p.buildSummary(items, totalMatching)
 
 	// Rebuild PR cache for getMRDiff lookups
-	p.prCache = make(map[int]bbPR)
+	p.prCache = make(map[string]bbPR)
 	for _, pr := range filtered {
-		p.prCache[pr.ID] = pr
+		p.prCache[prKey(pr)] = pr
 	}
 
 	if partialFetchErrors != "" {
@@ -772,10 +866,12 @@ func (p *bitbucketPlugin) degradedSnapshot(value, message, health string, retryA
 }
 
 func (p *bitbucketPlugin) snapshotFromAPIError(value string, err error) sdk.Snapshot {
-	if apiErr, ok := err.(*apiHTTPError); ok {
+	var apiErr *apiHTTPError
+	if errors.As(err, &apiErr) {
 		health := httphealth.ClassifyHTTPStatus(apiErr.StatusCode)
 		message := "Could not reach Bitbucket: " + apiErr.Error()
 		if health == sdk.HealthAuthReq {
+			p.invalidateCaches()
 			message = "Bitbucket authentication failed — reconnect in Settings"
 		} else if health == sdk.HealthRateLimited {
 			message = "Bitbucket API rate limited"
@@ -826,12 +922,15 @@ func (p *bitbucketPlugin) getJSON(urlStr string, target interface{}) error {
 		return &apiHTTPError{
 			StatusCode: resp.StatusCode,
 			RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After")),
-			Body:       string(body),
+			Body:       errorSnippet(body),
 		}
+	}
+	if isLoginPage(resp) {
+		return &apiHTTPError{StatusCode: http.StatusUnauthorized, Body: "session expired (redirected to login page)"}
 	}
 
 	if err := json.Unmarshal(body, target); err != nil {
-		return fmt.Errorf("decode response: %w (%s)", err, string(body))
+		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
 }
@@ -859,10 +958,14 @@ func (p *bitbucketPlugin) fetchCurrentUserServer() (*bbUser, error) {
 
 	// If we have a username from config/app-password, try to look up the user
 	if username != "" {
-		url := fmt.Sprintf("%s/users/%s", p.apiBase, username)
+		url := fmt.Sprintf("%s/users/%s", p.apiBase, neturl.PathEscape(username))
 		var su serverUser
 		if err := p.getJSON(url, &su); err != nil {
 			sdk.Log("server user lookup failed for %q: %v", username, err)
+			var apiErr *apiHTTPError
+			if errors.As(err, &apiErr) && apiErr.StatusCode != http.StatusNotFound {
+				return nil, err
+			}
 		} else {
 			sdk.Log("current user (server) name=%s displayName=%s", su.Name, su.DisplayName)
 			return &bbUser{UUID: su.Name, Username: su.Name, DisplayName: su.DisplayName}, nil
@@ -871,21 +974,45 @@ func (p *bitbucketPlugin) fetchCurrentUserServer() (*bbUser, error) {
 
 	// Try X-Ausername header from a lightweight request
 	resp, headers, err := p.doAPIGetHeaders(p.apiBase + "/application-properties")
-	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("api request: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &apiHTTPError{StatusCode: resp.StatusCode, RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After"))}
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if isLoginPage(resp) {
+			return nil, &apiHTTPError{StatusCode: http.StatusUnauthorized, Body: "session expired (redirected to login page)"}
+		}
 		if h := headers.Get("X-Ausername"); h != "" {
 			sdk.Log("current user (server, from header) username=%s", h)
 			return &bbUser{UUID: h, Username: h, DisplayName: h}, nil
 		}
-	}
-	if resp != nil {
-		resp.Body.Close()
 	}
 
 	return nil, fmt.Errorf("could not determine Bitbucket username — set it in plugin settings")
 }
 
 // --- fetchRepos ---
+
+// cachedRepos returns the repo list, re-fetching it at most every
+// repoCacheTTL; the paginated listing is the most expensive part of a refresh.
+func (p *bitbucketPlugin) cachedRepos() ([]bbRepo, error) {
+	if p.repos != nil && time.Since(p.reposFetched) < repoCacheTTL {
+		return p.repos, nil
+	}
+	repos, err := p.fetchRepos()
+	if err != nil {
+		return nil, err
+	}
+	if repos == nil {
+		repos = []bbRepo{}
+	}
+	p.repos = repos
+	p.reposFetched = time.Now()
+	return repos, nil
+}
 
 func (p *bitbucketPlugin) fetchRepos() ([]bbRepo, error) {
 	if p.serverMode {
@@ -931,7 +1058,7 @@ func (p *bitbucketPlugin) fetchReposServer() ([]bbRepo, error) {
 			fullName := p.workspace + "/" + r.Slug
 			all = append(all, bbRepo{FullName: fullName, Slug: r.Slug, Name: r.Name})
 		}
-		if page.IsLastPage {
+		if page.IsLastPage || len(page.Values) == 0 {
 			break
 		}
 		if page.NextPageStart != nil {
@@ -965,11 +1092,14 @@ func (p *bitbucketPlugin) fetchAllPRsCloud(repos []bbRepo) ([]bbPR, error) {
 		"values.destination.branch.name," +
 		"values.reviewers,values.participants,values.links.html.href,values.summary.raw,next"
 
+	sem := make(chan struct{}, maxConcurrentRequests)
 	for _, repo := range repos {
 		wg.Add(1)
 		go func(r bbRepo) {
 			defer wg.Done()
-			nextURL := fmt.Sprintf("%s/repositories/%s/%s/pullrequests?state=OPEN&pagelen=30&fields=%s",
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			nextURL := fmt.Sprintf("%s/repositories/%s/%s/pullrequests?state=OPEN&pagelen=50&fields=%s",
 				p.apiBase, p.workspace, r.Slug, prFields)
 
 			for nextURL != "" {
@@ -990,17 +1120,44 @@ func (p *bitbucketPlugin) fetchAllPRsCloud(repos []bbRepo) ([]bbPR, error) {
 	wg.Wait()
 	close(errCh)
 
-	var errs []string
-	for e := range errCh {
-		errs = append(errs, e.Error())
-	}
-	if len(errs) > 0 {
-		sdk.Log("some repo fetches failed: %s", strings.Join(errs, "; "))
-		return all, fmt.Errorf("partial: %s", strings.Join(errs, "; "))
+	if err := combineFetchErrors(errCh, len(repos)); err != nil {
+		return all, err
 	}
 
 	sdk.Log("fetched prs count=%d (cloud)", len(all))
 	return all, nil
+}
+
+// combineFetchErrors turns per-repo failures into a single error. When every
+// repo failed (e.g. revoked credentials or rate limiting) the underlying
+// error is returned so the snapshot reports auth_required / rate_limited;
+// otherwise a "partial:" error lets the caller show the PRs it did get.
+func combineFetchErrors(errCh <-chan error, total int) error {
+	var errs []error
+	for e := range errCh {
+		errs = append(errs, e)
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	for _, e := range errs {
+		var apiErr *apiHTTPError
+		if errors.As(e, &apiErr) {
+			switch httphealth.ClassifyHTTPStatus(apiErr.StatusCode) {
+			case httphealth.HealthAuthReq, httphealth.HealthRateLimited:
+				return e
+			}
+		}
+	}
+	if len(errs) == total {
+		return errs[0]
+	}
+	msgs := make([]string, 0, len(errs))
+	for _, e := range errs {
+		msgs = append(msgs, e.Error())
+	}
+	sdk.Log("some repo fetches failed: %s", strings.Join(msgs, "; "))
+	return fmt.Errorf("partial: %s", strings.Join(msgs, "; "))
 }
 
 func (p *bitbucketPlugin) mapCloudPR(pr cloudPR, repoSlug string) bbPR {
@@ -1008,8 +1165,8 @@ func (p *bitbucketPlugin) mapCloudPR(pr cloudPR, repoSlug string) bbPR {
 		ID:           pr.ID,
 		Title:        pr.Title,
 		State:        pr.State,
-		CreatedOn:    pr.CreatedOn,
-		UpdatedOn:    pr.UpdatedOn,
+		CreatedOn:    normalizeTimestamp(pr.CreatedOn),
+		UpdatedOn:    normalizeTimestamp(pr.UpdatedOn),
 		SourceBranch: pr.Source.Branch.Name,
 		DestBranch:   pr.Destination.Branch.Name,
 		SourceCommit: pr.Source.Commit.Hash,
@@ -1040,10 +1197,13 @@ func (p *bitbucketPlugin) fetchAllPRsServer(repos []bbRepo) ([]bbPR, error) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(repos))
 
+	sem := make(chan struct{}, maxConcurrentRequests)
 	for _, repo := range repos {
 		wg.Add(1)
 		go func(r bbRepo) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			start := 0
 			for {
 				url := fmt.Sprintf("%s/projects/%s/repos/%s/pull-requests?state=OPEN&limit=30&start=%d",
@@ -1066,7 +1226,7 @@ func (p *bitbucketPlugin) fetchAllPRsServer(repos []bbRepo) ([]bbPR, error) {
 				}
 				mu.Unlock()
 
-				if page.IsLastPage {
+				if page.IsLastPage || len(page.Values) == 0 {
 					break
 				}
 				if page.NextPageStart != nil {
@@ -1080,13 +1240,8 @@ func (p *bitbucketPlugin) fetchAllPRsServer(repos []bbRepo) ([]bbPR, error) {
 	wg.Wait()
 	close(errCh)
 
-	var errs []string
-	for e := range errCh {
-		errs = append(errs, e.Error())
-	}
-	if len(errs) > 0 {
-		sdk.Log("some repo fetches failed: %s", strings.Join(errs, "; "))
-		return all, fmt.Errorf("partial: %s", strings.Join(errs, "; "))
+	if err := combineFetchErrors(errCh, len(repos)); err != nil {
+		return all, err
 	}
 
 	sdk.Log("fetched prs count=%d (server)", len(all))
@@ -1127,7 +1282,7 @@ func (p *bitbucketPlugin) mapServerPR(sp serverPR, repo bbRepo) bbPR {
 				DisplayName: pt.User.DisplayName,
 			},
 			Approved: pt.Approved,
-			State:    pt.Status,
+			State:    normalizeServerReviewStatus(pt.Status),
 		})
 	}
 	return mapped
@@ -1135,23 +1290,85 @@ func (p *bitbucketPlugin) mapServerPR(sp serverPR, repo bbRepo) bbPR {
 
 // --- fetchBuildStatuses ---
 
-func (p *bitbucketPlugin) fetchBuildStatuses(prs []bbPR) map[int][]bbCommitStatus {
-	if p.serverMode {
-		return p.fetchBuildStatusesServer(prs)
+// fetchBuildStatuses loads commit/build statuses for the (already capped)
+// visible PRs with bounded parallelism. Failures are logged and skipped so a
+// missing pipeline scope never blanks the PR list.
+func (p *bitbucketPlugin) fetchBuildStatuses(prs []bbPR) map[string][]bbCommitStatus {
+	result := make(map[string][]bbCommitStatus)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentRequests)
+	for _, pr := range prs {
+		wg.Add(1)
+		go func(pr bbPR) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			var sts []bbCommitStatus
+			var err error
+			if p.serverMode {
+				sts, err = p.fetchBuildStatusesServer(pr)
+			} else {
+				sts, err = p.fetchBuildStatusesCloud(pr)
+			}
+			if err != nil {
+				sdk.Log("build statuses %s: %v", prKey(pr), err)
+				return
+			}
+			if len(sts) > 0 {
+				mu.Lock()
+				result[prKey(pr)] = sts
+				mu.Unlock()
+			}
+		}(pr)
 	}
-	return p.fetchBuildStatusesCloud(prs)
+	wg.Wait()
+	return result
 }
 
-func (p *bitbucketPlugin) fetchBuildStatusesCloud(prs []bbPR) map[int][]bbCommitStatus {
-	// Build statuses require repo slug which isn't available in the mapped PR.
-	// Will be implemented when repo slug is added to the bbPR struct.
-	return make(map[int][]bbCommitStatus)
+func (p *bitbucketPlugin) fetchBuildStatusesCloud(pr bbPR) ([]bbCommitStatus, error) {
+	url := fmt.Sprintf("%s/repositories/%s/%s/pullrequests/%d/statuses?pagelen=25", p.apiBase, p.workspace, pr.RepoSlug, pr.ID)
+	var page cloudPaginatedStatuses
+	if err := p.getJSON(url, &page); err != nil {
+		return nil, err
+	}
+	out := make([]bbCommitStatus, 0, len(page.Values))
+	for _, s := range page.Values {
+		out = append(out, bbCommitStatus{
+			Key:       s.Key,
+			Name:      s.Name,
+			State:     strings.ToUpper(s.State),
+			URL:       s.URL,
+			CreatedOn: normalizeTimestamp(s.CreatedOn),
+		})
+	}
+	return out, nil
 }
 
-func (p *bitbucketPlugin) fetchBuildStatusesServer(prs []bbPR) map[int][]bbCommitStatus {
-	// Build statuses require repo slug which isn't available in the mapped PR.
-	// Will be implemented when repo slug is added to the bbPR struct.
-	return make(map[int][]bbCommitStatus)
+func (p *bitbucketPlugin) fetchBuildStatusesServer(pr bbPR) ([]bbCommitStatus, error) {
+	if pr.SourceCommit == "" {
+		return nil, nil
+	}
+	url := fmt.Sprintf("%s/rest/build-status/1.0/commits/%s?limit=25", p.webBase, neturl.PathEscape(pr.SourceCommit))
+	var page serverPaginatedResponse
+	if err := p.getJSON(url, &page); err != nil {
+		return nil, err
+	}
+	out := make([]bbCommitStatus, 0, len(page.Values))
+	for _, raw := range page.Values {
+		var b serverBuild
+		if err := json.Unmarshal(raw, &b); err != nil {
+			continue
+		}
+		out = append(out, bbCommitStatus{
+			Key:       b.Key,
+			Name:      b.Name,
+			State:     strings.ToUpper(b.State),
+			URL:       b.URL,
+			CreatedOn: millisToISO(b.BuildDate),
+		})
+	}
+	return out, nil
 }
 
 // --- Filtering ---
@@ -1167,13 +1384,14 @@ func (p *bitbucketPlugin) filterPRs(all []bbPR) []bbPR {
 	}
 
 	var filtered []bbPR
-	seen := make(map[int]bool)
+	seen := make(map[string]bool)
 
 	for _, pr := range all {
-		if seen[pr.ID] {
+		key := prKey(pr)
+		if seen[key] {
 			continue
 		}
-		seen[pr.ID] = true
+		seen[key] = true
 
 		if p.isExcluded(pr.Author.Username) {
 			continue
@@ -1202,13 +1420,10 @@ func (p *bitbucketPlugin) filterPRs(all []bbPR) []bbPR {
 
 // --- Snapshot builders ---
 
-func (p *bitbucketPlugin) buildItems(prs []bbPR, statuses map[int][]bbCommitStatus) []sdk.Item {
+func (p *bitbucketPlugin) buildItems(prs []bbPR, statuses map[string][]bbCommitStatus) []sdk.Item {
 	items := make([]sdk.Item, 0, len(prs))
 	for _, pr := range prs {
-		repoName := pr.DestBranch
-		if repoName == "" {
-			repoName = pr.SourceBranch
-		}
+		repoName := pr.RepoSlug
 		severity := prSeverity(pr, p.currentUser, statuses)
 		detail := prDetail(pr, p.currentUser, statuses)
 
@@ -1219,7 +1434,7 @@ func (p *bitbucketPlugin) buildItems(prs []bbPR, statuses map[int][]bbCommitStat
 
 		deepLink := pr.DeepLink
 		if deepLink == "" {
-			deepLink = fmt.Sprintf("%s/%s/pull-requests/%d", p.webBase, repoName, pr.ID)
+			deepLink = fmt.Sprintf("%s/%s/%s/pull-requests/%d", p.webBase, p.workspace, repoName, pr.ID)
 		}
 
 		title := pr.Title
@@ -1230,7 +1445,7 @@ func (p *bitbucketPlugin) buildItems(prs []bbPR, statuses map[int][]bbCommitStat
 		subtitle := fmt.Sprintf("%s · %s", repoName, pr.Author.DisplayName)
 
 		items = append(items, sdk.Item{
-			ID:        fmt.Sprintf("%d", pr.ID),
+			ID:        prKey(pr),
 			Title:     title,
 			Subtitle:  subtitle,
 			Detail:    detail,
@@ -1253,12 +1468,12 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-func (p *bitbucketPlugin) buildAlerts(prs []bbPR, statuses map[int][]bbCommitStatus) []sdk.Alert {
+func (p *bitbucketPlugin) buildAlerts(prs []bbPR, statuses map[string][]bbCommitStatus) []sdk.Alert {
 	var alerts []sdk.Alert
 
 	failCount := 0
 	for _, pr := range prs {
-		if buildFailed(statuses[pr.ID]) {
+		if buildFailed(statuses[prKey(pr)]) {
 			failCount++
 		}
 	}
@@ -1325,11 +1540,11 @@ func (p *bitbucketPlugin) buildSummary(items []sdk.Item, total int) sdk.Summary 
 
 // --- Event detection ---
 
-func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitStatus) {
+func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[string][]bbCommitStatus) {
 	currentStates := make(map[string]prStateInfo)
 	for _, pr := range prs {
-		key := fmt.Sprintf("%d", pr.ID)
-		currentStates[key] = prStateInfo{hash: prStateHash(pr, statuses[pr.ID]), deepLink: pr.DeepLink}
+		key := prKey(pr)
+		currentStates[key] = prStateInfo{hash: prStateHash(pr, statuses[key]), deepLink: pr.DeepLink}
 	}
 
 	prevKeys := p.prevPRStates
@@ -1340,7 +1555,7 @@ func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitSt
 			sdk.Log("pr removed id=%s", key)
 			sdk.Emit(sdk.Event{
 				Type:     "pr.merged",
-				Message:  fmt.Sprintf("PR #%s was merged or closed", key),
+				Message:  fmt.Sprintf("PR %s was merged or closed", key),
 				Severity: sdk.SeverityInfo,
 				Data:     map[string]string{"prId": key, "url": oldState.deepLink},
 			})
@@ -1352,7 +1567,7 @@ func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitSt
 			if !oldFailed && newFailed {
 				sdk.Emit(sdk.Event{
 					Type:     "pr.status_failed",
-					Message:  fmt.Sprintf("Build failed on PR #%s", key),
+					Message:  fmt.Sprintf("Build failed on PR %s", key),
 					Severity: sdk.SeverityCritical,
 					Data:     map[string]string{"prId": key, "url": newState.deepLink},
 				})
@@ -1365,7 +1580,7 @@ func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitSt
 			sdk.Log("new pr id=%s", key)
 			sdk.Emit(sdk.Event{
 				Type:     "pr.created",
-				Message:  fmt.Sprintf("New pull request #%s", key),
+				Message:  fmt.Sprintf("New pull request %s", key),
 				Severity: sdk.SeverityInfo,
 				Data:     map[string]string{"prId": key, "url": info.deepLink},
 			})
@@ -1377,8 +1592,8 @@ func (p *bitbucketPlugin) detectEvents(prs []bbPR, statuses map[int][]bbCommitSt
 
 // --- Helpers ---
 
-func prSeverity(pr bbPR, currentUser *bbUser, statuses map[int][]bbCommitStatus) string {
-	if buildFailed(statuses[pr.ID]) {
+func prSeverity(pr bbPR, currentUser *bbUser, statuses map[string][]bbCommitStatus) string {
+	if buildFailed(statuses[prKey(pr)]) {
 		return sdk.SeverityCritical
 	}
 	if hasChangesRequested(pr, currentUser) {
@@ -1387,7 +1602,7 @@ func prSeverity(pr bbPR, currentUser *bbUser, statuses map[int][]bbCommitStatus)
 	return sdk.SeverityInfo
 }
 
-func prDetail(pr bbPR, currentUser *bbUser, statuses map[int][]bbCommitStatus) string {
+func prDetail(pr bbPR, currentUser *bbUser, statuses map[string][]bbCommitStatus) string {
 	parts := []string{
 		fmt.Sprintf("%s → %s", pr.SourceBranch, pr.DestBranch),
 	}
@@ -1419,7 +1634,7 @@ func prDetail(pr bbPR, currentUser *bbUser, statuses map[int][]bbCommitStatus) s
 		}
 	}
 
-	sts := statuses[pr.ID]
+	sts := statuses[prKey(pr)]
 	if len(sts) > 0 {
 		latest := sts[0]
 		for _, s := range sts[1:] {
@@ -1518,6 +1733,33 @@ func (p *bitbucketPlugin) isExcluded(username string) bool {
 	return false
 }
 
+// normalizeTimestamp converts Bitbucket Cloud timestamps (RFC 3339 with
+// microseconds and "+00:00") to plain UTC RFC 3339 for the host.
+func normalizeTimestamp(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return raw
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// normalizeServerReviewStatus maps Bitbucket Server participant statuses to
+// the Cloud vocabulary used by the review helpers.
+func normalizeServerReviewStatus(status string) string {
+	switch strings.ToUpper(status) {
+	case "NEEDS_WORK":
+		return "changes_requested"
+	case "APPROVED":
+		return "approved"
+	default:
+		return strings.ToLower(status)
+	}
+}
+
 func millisToISO(ms int64) string {
 	if ms == 0 {
 		return ""
@@ -1597,6 +1839,6 @@ func main() {
 			MaxPRs:             10,
 		},
 		prevPRStates: make(map[string]prStateInfo),
-		prCache:      make(map[int]bbPR),
+		prCache:      make(map[string]bbPR),
 	})
 }

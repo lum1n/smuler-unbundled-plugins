@@ -33,14 +33,14 @@ type ProviderAuthContext struct {
 
 // Snapshot is the plugin status payload returned for getStatus/refresh.
 type Snapshot struct {
-	PluginID     string  `json:"pluginId"`
-	State        string  `json:"state"`
-	Summary      Summary `json:"summary"`
-	Items        []Item  `json:"items"`
+	PluginID     string   `json:"pluginId"`
+	State        string   `json:"state"`
+	Summary      Summary  `json:"summary"`
+	Items        []Item   `json:"items"`
 	Actions      []Action `json:"actions"`
-	Alerts       []Alert `json:"alerts"`
-	RefreshAfter int     `json:"refreshAfter"`
-	Health       string  `json:"health"`
+	Alerts       []Alert  `json:"alerts"`
+	RefreshAfter int      `json:"refreshAfter"`
+	Health       string   `json:"health"`
 }
 
 // MarshalJSON ensures nil slices encode as [] instead of null.

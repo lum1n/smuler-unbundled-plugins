@@ -2,8 +2,13 @@ package email
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrAuthFailed marks errors caused by missing or rejected credentials, so the
+// host can surface auth_required instead of a generic connection error.
+var ErrAuthFailed = errors.New("authentication failed")
 
 const (
 	ProviderGmail   = "gmail"
@@ -50,10 +55,19 @@ type EmailMessage struct {
 	WebLink      string
 }
 
+// UnreadResult is one INBOX poll: the newest unread messages (newest first,
+// at most the requested limit), the total unread count, and the UIDs that
+// became unread since the previous poll (empty on the first poll).
+type UnreadResult struct {
+	Messages []EmailMessage
+	Total    int
+	NewUIDs  []uint32
+}
+
 type MailProvider interface {
 	Account() Account
 	Connect() error
-	FetchUnread(ctx context.Context, limit int) ([]EmailMessage, error)
+	FetchUnread(ctx context.Context, limit int) (UnreadResult, error)
 	MarkRead(uid uint32) error
 	Archive(uid uint32) error
 	Close() error

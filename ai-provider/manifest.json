@@ -1,7 +1,7 @@
 {
   "id": "ai-provider",
   "name": "AI Providers",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Usage limits and quota tracking for AI coding providers",
   "icon": {
     "type": "sfSymbol",
@@ -60,17 +60,9 @@
     {
       "id": "claude",
       "displayName": "Claude",
-      "authKind": "oauth",
-      "description": "Sign in with Anthropic to track Claude usage limits and reset times.",
-      "deepLink": "https://console.anthropic.com/settings/usage",
-      "oauth": {
-        "authorizeURL": "https://console.anthropic.com/oauth/authorize",
-        "tokenURL": "https://api.anthropic.com/oauth/token",
-        "clientId": "smuler-claude",
-        "scopes": [
-          "usage:read"
-        ]
-      },
+      "authKind": "api_key",
+      "description": "Uses your Claude Code login automatically (macOS Keychain or ~/.claude/.credentials.json; run `claude` and /login first). Optional: paste a Claude OAuth access token (sk-ant-oat…) instead. Anthropic API keys cannot read plan usage.",
+      "deepLink": "https://claude.ai/settings/usage",
       "defaultEnabled": false,
       "showEnableToggle": true
     },

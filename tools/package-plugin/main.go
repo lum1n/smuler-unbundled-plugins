@@ -57,6 +57,13 @@ func fatal(err error) {
 }
 
 func generateKey(path string) error {
+	// Never clobber an existing signing key: published packages are verified
+	// against its public key, so replacing it breaks every future update.
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("key %s already exists; refusing to overwrite", path)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -99,6 +106,9 @@ func packagePlugin(pluginDir, keyPath, outDir string) error {
 	}
 	if meta.ID == "" || meta.Version == "" || meta.Executable == "" {
 		return fmt.Errorf("manifest missing id/version/executable")
+	}
+	if !filepath.IsLocal(meta.Executable) || meta.ID != filepath.Base(meta.ID) {
+		return fmt.Errorf("manifest id/executable must be relative paths inside the plugin")
 	}
 
 	priv, pub, err := loadKey(keyPath)
@@ -475,17 +485,25 @@ func encodeObjectPretty(fields []objectField) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func writeTarGz(archivePath, dir, rootName string) error {
+func writeTarGz(archivePath, dir, rootName string) (err error) {
 	f, err := os.Create(archivePath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
 	gz := gzip.NewWriter(f)
-	defer gz.Close()
 	tw := tar.NewWriter(gz)
-	defer tw.Close()
+	// Close errors flush the final tar/gzip blocks; surfacing them prevents a
+	// silently truncated archive from being hashed and published.
+	defer func() {
+		for _, c := range []io.Closer{tw, gz, f} {
+			if cerr := c.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}
+		if err != nil {
+			_ = os.Remove(archivePath)
+		}
+	}()
 
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -496,17 +514,15 @@ func writeTarGz(archivePath, dir, rootName string) error {
 			return err
 		}
 		name := filepath.ToSlash(filepath.Join(rootName, rel))
-		if info.IsDir() {
-			hdr, err := tar.FileInfoHeader(info, "")
-			if err != nil {
-				return err
-			}
-			hdr.Name = name + "/"
-			return tw.WriteHeader(hdr)
-		}
 		hdr, err := tar.FileInfoHeader(info, "")
 		if err != nil {
 			return err
+		}
+		// Do not publish the packager's local account names/ids.
+		hdr.Uid, hdr.Gid, hdr.Uname, hdr.Gname = 0, 0, "", ""
+		if info.IsDir() {
+			hdr.Name = name + "/"
+			return tw.WriteHeader(hdr)
 		}
 		hdr.Name = name
 		if err := tw.WriteHeader(hdr); err != nil {

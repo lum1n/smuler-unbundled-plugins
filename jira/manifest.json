@@ -1,7 +1,7 @@
 {
   "id": "jira",
   "name": "Jira",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Assigned issues and workflow signals from Jira",
   "icon": {
     "type": "sfSymbol",
@@ -104,7 +104,7 @@
       "storageProviderId": "jira",
       "displayName": "Cookie Auth",
       "authKind": "browser_import",
-      "description": "Import a signed-in browser session cookie for your Jira domain. Set the domain above first, then sign in and close the window.",
+      "description": "Import a signed-in browser session for your Jira domain. Set the domain above first, then sign in and close the window.",
       "deepLink": "https://id.atlassian.com/login",
       "showEnableToggle": false,
       "allowMultipleAccounts": false,

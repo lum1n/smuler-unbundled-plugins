@@ -15,10 +15,10 @@ import (
 type Kind string
 
 const (
-	KindContradiction   Kind = "contradiction"
-	KindMissingRule     Kind = "missing_rule"
+	KindContradiction     Kind = "contradiction"
+	KindMissingRule       Kind = "missing_rule"
 	KindConflictingAgents Kind = "conflicting_agents"
-	KindStaleRule       Kind = "stale_rule"
+	KindStaleRule         Kind = "stale_rule"
 )
 
 // Severity indicates how strongly to surface the suggestion.
@@ -75,7 +75,7 @@ var phrasePattern = regexp.MustCompile(`"([^"]{5,80})"|'([^']{5,80})'|\b(use|alw
 
 // Analyzer detects drift between agent behavior and project rules.
 type Analyzer struct {
-	storePath     string
+	storePath      string
 	contradictions []contradictionPair
 }
 
@@ -102,6 +102,7 @@ func (a *Analyzer) Analyze(repo string, rules []string, sessions []Session) []Su
 	newSuggestions = append(newSuggestions, a.detectConflictingAgents(repo, sessions)...)
 
 	now := time.Now().UnixMilli()
+	changed := false
 	for _, ns := range newSuggestions {
 		if old, ok := byID[ns.ID]; ok {
 			// Preserve status/snooze from existing suggestion.
@@ -110,6 +111,7 @@ func (a *Analyzer) Analyze(repo string, rules []string, sessions []Session) []Su
 			ns.CreatedAt = old.CreatedAt
 		} else {
 			ns.CreatedAt = now
+			changed = true
 		}
 		byID[ns.ID] = ns
 	}
@@ -119,12 +121,37 @@ func (a *Analyzer) Analyze(repo string, rules []string, sessions []Session) []Su
 		out = append(out, s)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt > out[j].CreatedAt
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt > out[j].CreatedAt
+		}
+		return out[i].ID < out[j].ID
 	})
+	// Suggestion IDs embed session IDs, so the store grows with every session;
+	// keep only the most recent entries.
+	if len(out) > maxStoredSuggestions {
+		out = out[:maxStoredSuggestions]
+		changed = true
+	}
 
-	a.save(out)
-	return a.active(out)
+	// Only rewrite the store when something new appeared; this runs on every
+	// refresh for every repo.
+	if changed {
+		_ = a.save(out)
+	}
+
+	// Return only this repo's suggestions; returning every stored suggestion
+	// duplicated other repos' entries (same item IDs) once per repo.
+	var repoOut []Suggestion
+	for _, s := range a.active(out) {
+		if s.Repo == repo {
+			repoOut = append(repoOut, s)
+		}
+	}
+	return repoOut
 }
+
+// maxStoredSuggestions caps the persisted suggestion store.
+const maxStoredSuggestions = 200
 
 // Load returns all stored suggestions (including dismissed/snoozed).
 func (a *Analyzer) Load() []Suggestion {
@@ -233,27 +260,27 @@ func (a *Analyzer) detectContradictions(repo string, rules []string, sessions []
 
 			if aInRule && taskHasB && !taskHasA {
 				out = append(out, Suggestion{
-					ID:           fmt.Sprintf("contradiction-%s-%s-%s", repo, pair.a, sess.ID),
-					Kind:         KindContradiction,
-					Severity:     SeverityWarning,
-					Repo:         repo,
-					Title:        fmt.Sprintf("Possible contradiction with %s rule", pair.a),
-					Description:  fmt.Sprintf("Rules mention '%s', but a recent agent task asks for '%s'.", pair.a, pair.b),
-					Evidence:     []string{sess.Task},
-					ProposedPath: filepath.Join("AGENTS.md"),
+					ID:            fmt.Sprintf("contradiction-%s-%s-%s", repo, pair.a, sess.ID),
+					Kind:          KindContradiction,
+					Severity:      SeverityWarning,
+					Repo:          repo,
+					Title:         fmt.Sprintf("Possible contradiction with %s rule", pair.a),
+					Description:   fmt.Sprintf("Rules mention '%s', but a recent agent task asks for '%s'.", pair.a, pair.b),
+					Evidence:      []string{sess.Task},
+					ProposedPath:  filepath.Join("AGENTS.md"),
 					ProposedPatch: fmt.Sprintf("\n## %s\nWhen refactoring, prefer %s to stay consistent with existing rules.\n", pair.a, pair.a),
 				})
 			}
 			if bInRule && taskHasA && !taskHasB {
 				out = append(out, Suggestion{
-					ID:           fmt.Sprintf("contradiction-%s-%s-%s", repo, pair.b, sess.ID),
-					Kind:         KindContradiction,
-					Severity:     SeverityWarning,
-					Repo:         repo,
-					Title:        fmt.Sprintf("Possible contradiction with %s rule", pair.b),
-					Description:  fmt.Sprintf("Rules mention '%s', but a recent agent task asks for '%s'.", pair.b, pair.a),
-					Evidence:     []string{sess.Task},
-					ProposedPath: filepath.Join("AGENTS.md"),
+					ID:            fmt.Sprintf("contradiction-%s-%s-%s", repo, pair.b, sess.ID),
+					Kind:          KindContradiction,
+					Severity:      SeverityWarning,
+					Repo:          repo,
+					Title:         fmt.Sprintf("Possible contradiction with %s rule", pair.b),
+					Description:   fmt.Sprintf("Rules mention '%s', but a recent agent task asks for '%s'.", pair.b, pair.a),
+					Evidence:      []string{sess.Task},
+					ProposedPath:  filepath.Join("AGENTS.md"),
 					ProposedPatch: fmt.Sprintf("\n## %s\nWhen refactoring, prefer %s to stay consistent with existing rules.\n", pair.b, pair.b),
 				})
 			}
@@ -292,14 +319,14 @@ func (a *Analyzer) detectMissingRules(repo string, rules []string, sessions []Se
 	for phrase, count := range phraseCounts {
 		if count >= 2 {
 			out = append(out, Suggestion{
-				ID:           fmt.Sprintf("missing-rule-%s-%s", repo, hashPhrase(phrase)),
-				Kind:         KindMissingRule,
-				Severity:     SeverityInfo,
-				Repo:         repo,
-				Title:        "Consider codifying repeated instruction",
-				Description:  fmt.Sprintf("The instruction '%s' appeared in %d agent sessions but is not in any rule file.", phrase, count),
-				Evidence:     []string{phraseExamples[phrase]},
-				ProposedPath: filepath.Join("AGENTS.md"),
+				ID:            fmt.Sprintf("missing-rule-%s-%s", repo, hashPhrase(phrase)),
+				Kind:          KindMissingRule,
+				Severity:      SeverityInfo,
+				Repo:          repo,
+				Title:         "Consider codifying repeated instruction",
+				Description:   fmt.Sprintf("The instruction '%s' appeared in %d agent sessions but is not in any rule file.", phrase, count),
+				Evidence:      []string{phraseExamples[phrase]},
+				ProposedPath:  filepath.Join("AGENTS.md"),
 				ProposedPatch: fmt.Sprintf("\n## Repeated instruction\n%s\n", phrase),
 			})
 		}
@@ -327,14 +354,14 @@ func (a *Analyzer) detectConflictingAgents(repo string, sessions []Session) []Su
 				aInB := strings.Contains(tb, pair.a)
 				if (aInA && bInB) || (bInA && aInB) {
 					out = append(out, Suggestion{
-						ID:           fmt.Sprintf("conflict-%s-%s-%s", repo, sa.ID, sb.ID),
-						Kind:         KindConflictingAgents,
-						Severity:     SeverityCritical,
-						Repo:         repo,
-						Title:        "Conflicting agent instructions",
-						Description:  fmt.Sprintf("Two agents on %s received opposing instructions about '%s' vs '%s'.", repo, pair.a, pair.b),
-						Evidence:     []string{sa.Task, sb.Task},
-						ProposedPath: filepath.Join("AGENTS.md"),
+						ID:            fmt.Sprintf("conflict-%s-%s-%s", repo, sa.ID, sb.ID),
+						Kind:          KindConflictingAgents,
+						Severity:      SeverityCritical,
+						Repo:          repo,
+						Title:         "Conflicting agent instructions",
+						Description:   fmt.Sprintf("Two agents on %s received opposing instructions about '%s' vs '%s'.", repo, pair.a, pair.b),
+						Evidence:      []string{sa.Task, sb.Task},
+						ProposedPath:  filepath.Join("AGENTS.md"),
 						ProposedPatch: fmt.Sprintf("\n## Conflict resolution\nClarify whether to use %s or %s across the project.\n", pair.a, pair.b),
 					})
 				}
@@ -352,7 +379,8 @@ func hashPhrase(s string) string {
 			h = -h
 		}
 	}
-	return fmt.Sprintf("%x", h)[:8]
+	hex := fmt.Sprintf("%08x", h)
+	return hex[:8]
 }
 
 // Session is a lightweight input for drift analysis.

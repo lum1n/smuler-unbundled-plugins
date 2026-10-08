@@ -16,14 +16,14 @@ type MeResponse struct {
 
 // AgentListItem is a summary row from GET /v1/agents.
 type AgentListItem struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Status      string    `json:"status"`
-	Env         AgentEnv  `json:"env"`
-	URL         string    `json:"url"`
-	CreatedAt   string    `json:"createdAt"`
-	UpdatedAt   string    `json:"updatedAt"`
-	LatestRunID string    `json:"latestRunId"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Status      string   `json:"status"`
+	Env         AgentEnv `json:"env"`
+	URL         string   `json:"url"`
+	CreatedAt   string   `json:"createdAt"`
+	UpdatedAt   string   `json:"updatedAt"`
+	LatestRunID string   `json:"latestRunId"`
 }
 
 // AgentEnv describes where an agent runs.
@@ -55,14 +55,14 @@ type AgentListResponse struct {
 
 // RunDetail is returned by GET /v1/agents/{id}/runs/{runId}.
 type RunDetail struct {
-	ID         string  `json:"id"`
-	AgentID    string  `json:"agentId"`
-	Status     string  `json:"status"`
-	CreatedAt  string  `json:"createdAt"`
-	UpdatedAt  string  `json:"updatedAt"`
-	DurationMs int     `json:"durationMs"`
-	Result     string  `json:"result"`
-	Git        RunGit  `json:"git"`
+	ID         string `json:"id"`
+	AgentID    string `json:"agentId"`
+	Status     string `json:"status"`
+	CreatedAt  string `json:"createdAt"`
+	UpdatedAt  string `json:"updatedAt"`
+	DurationMs int    `json:"durationMs"`
+	Result     string `json:"result"`
+	Git        RunGit `json:"git"`
 }
 
 // RunGit holds pushed branches for an agent run.
@@ -88,8 +88,8 @@ type TokenUsage struct {
 
 // AgentUsageResponse is returned by GET /v1/agents/{id}/usage.
 type AgentUsageResponse struct {
-	TotalUsage TokenUsage       `json:"totalUsage"`
-	Runs       []RunUsageEntry  `json:"runs"`
+	TotalUsage TokenUsage      `json:"totalUsage"`
+	Runs       []RunUsageEntry `json:"runs"`
 }
 
 // RunUsageEntry is per-run usage inside AgentUsageResponse.
@@ -124,6 +124,8 @@ type EnrichOptions struct {
 type APIError struct {
 	StatusCode int
 	Body       string
+	// RetryAfter is the parsed Retry-After header in seconds (0 if absent).
+	RetryAfter int
 }
 
 func (e *APIError) Error() string {

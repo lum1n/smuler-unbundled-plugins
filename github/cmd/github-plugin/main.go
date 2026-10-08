@@ -15,8 +15,13 @@ import (
 
 const (
 	pluginID      = "github"
-	pluginVersion   = "0.1.2"
+	pluginVersion = "0.1.2"
 	apiBase       = "https://api.github.com"
+
+	// searchPageSize is fetched in one request so delta events see the whole
+	// review queue (not just the displayed rows).
+	searchPageSize  = 50
+	maxDisplayItems = 3
 )
 
 // --- GitHub API types ---
@@ -27,6 +32,7 @@ type ghSearchResponse struct {
 }
 
 type ghPR struct {
+	ID            int64  `json:"id"`
 	Number        int    `json:"number"`
 	Title         string `json:"title"`
 	HTMLURL       string `json:"html_url"`
@@ -60,29 +66,45 @@ type githubPlugin struct {
 	client  *http.Client
 	apiBase string
 
-	prevPRs         map[string]prevPRInfo // pr-N -> info
+	prevPRs         map[string]prevPRInfo // itemID -> info
 	prevReviewCount int
+	seeded          bool              // true once a successful snapshot has populated prevPRs
 	prMetaMap       map[string]prMeta // itemID -> metadata for getMRDiff
 }
 
 func (p *githubPlugin) Initialize(params sdk.InitializeParams) string {
-	for _, auth := range params.ProviderAuths {
-		if auth.AccountID != "" {
-			p.token = auth.AccountID
-			break
-		}
-		if auth.AccessToken != "" {
-			p.token = auth.AccessToken
-			break
-		}
-	}
-	if p.token == "" && params.Auth != nil && params.Auth.AccountID != "" {
-		p.token = params.Auth.AccountID
-	}
+	p.token = resolveToken(params)
 	if p.token == "" {
 		return sdk.HealthAuthReq
 	}
 	return sdk.HealthOK
+}
+
+// resolveToken picks the GitHub token from initialize params. Provider auth
+// records carry the secret in accessToken (OAuth) or apiKey; their accountId is
+// only a record identifier (often a UUID), so it is used as a last resort for
+// older hosts that stored the token there. The legacy single-token auth
+// context stores the raw token in accountId.
+func resolveToken(params sdk.InitializeParams) string {
+	for _, auth := range params.ProviderAuths {
+		if t := strings.TrimSpace(auth.AccessToken); t != "" {
+			return t
+		}
+		if t := strings.TrimSpace(auth.APIKey); t != "" {
+			return t
+		}
+	}
+	if params.Auth != nil {
+		if t := strings.TrimSpace(params.Auth.AccountID); t != "" {
+			return t
+		}
+	}
+	for _, auth := range params.ProviderAuths {
+		if t := strings.TrimSpace(auth.AccountID); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 func (p *githubPlugin) GetStatus() sdk.Snapshot {
@@ -122,9 +144,38 @@ func (p *githubPlugin) apiRequest(path string) (httpResponse, error) {
 }
 
 type httpResponse struct {
-	StatusCode int
-	Body       []byte
-	RetryAfter int
+	StatusCode  int
+	Body        []byte
+	RetryAfter  int
+	RateLimited bool
+}
+
+// maxBodyBytes caps how much of a response is read (diffs can be very large).
+const maxBodyBytes = 4 << 20
+
+// rateLimitStatus reports whether a GitHub response is a primary or secondary
+// rate limit and how many seconds to wait. GitHub signals primary limits with
+// 403/429 + X-RateLimit-Remaining: 0 (reset in X-RateLimit-Reset) and
+// secondary limits with 403/429 + Retry-After.
+func rateLimitStatus(statusCode int, h http.Header, body []byte) (bool, int) {
+	retryAfter := httphealth.ParseRetryAfter(h.Get("Retry-After"))
+	if retryAfter == 0 && h.Get("X-RateLimit-Remaining") == "0" {
+		if reset, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64); err == nil {
+			if d := time.Until(time.Unix(reset, 0)); d > 0 {
+				retryAfter = int(d.Seconds()) + 1
+			}
+		}
+	}
+	switch statusCode {
+	case http.StatusTooManyRequests:
+		return true, retryAfter
+	case http.StatusForbidden:
+		if h.Get("X-RateLimit-Remaining") == "0" || h.Get("Retry-After") != "" ||
+			strings.Contains(strings.ToLower(string(body)), "rate limit") {
+			return true, retryAfter
+		}
+	}
+	return false, retryAfter
 }
 
 func (p *githubPlugin) apiRequestRaw(path string, acceptHeader string) (httpResponse, error) {
@@ -148,15 +199,19 @@ func (p *githubPlugin) apiRequestRaw(path string, acceptHeader string) (httpResp
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
 		return httpResponse{}, err
 	}
+	// Drain any remainder so the connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
 
+	rateLimited, retryAfter := rateLimitStatus(resp.StatusCode, resp.Header, body)
 	return httpResponse{
-		StatusCode: resp.StatusCode,
-		Body:       body,
-		RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After")),
+		StatusCode:  resp.StatusCode,
+		Body:        body,
+		RetryAfter:  retryAfter,
+		RateLimited: rateLimited,
 	}, nil
 }
 
@@ -167,6 +222,9 @@ func (p *githubPlugin) fetchPRDiff(repo string, number int) (string, error) {
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch PR diff: %w", err)
+	}
+	if resp.RateLimited {
+		return "", fmt.Errorf("GitHub API rate limited")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
@@ -232,7 +290,7 @@ func (p *githubPlugin) buildSnapshot() sdk.Snapshot {
 		}
 	}
 
-	body, err := p.apiRequest("/search/issues?q=is:pr+is:open+review-requested:@me+archived:false&per_page=5&sort=updated&order=desc")
+	body, err := p.apiRequest("/search/issues?q=is:pr+is:open+review-requested:@me+archived:false&per_page=" + strconv.Itoa(searchPageSize) + "&sort=updated&order=desc")
 	if err != nil {
 		msg := fmt.Sprintf("API unreachable: %v", err)
 		return sdk.Snapshot{
@@ -250,6 +308,23 @@ func (p *githubPlugin) buildSnapshot() sdk.Snapshot {
 		}
 	}
 
+	if body.RateLimited {
+		msg := "GitHub API rate limited"
+		return sdk.Snapshot{
+			PluginID: pluginID,
+			State:    sdk.StateDegraded,
+			Summary: sdk.Summary{
+				Title: "GitHub", Value: "Rate limited", Trend: sdk.TrendSteady,
+				Severity: sdk.SeverityWarning, IconHint: "pull-request",
+			},
+			Items:        []sdk.Item{},
+			Actions:      []sdk.Action{},
+			Alerts:       []sdk.Alert{{ID: "github-rate-limit", Severity: sdk.SeverityWarning, Message: msg}},
+			RefreshAfter: httphealth.DefaultRefreshAfter(httphealth.HealthRateLimited, body.RetryAfter),
+			Health:       httphealth.HealthRateLimited,
+		}
+	}
+
 	if body.StatusCode == http.StatusUnauthorized || body.StatusCode == http.StatusForbidden {
 		msg := "GitHub authentication failed — reconnect in Settings"
 		return sdk.Snapshot{
@@ -264,23 +339,6 @@ func (p *githubPlugin) buildSnapshot() sdk.Snapshot {
 			Alerts:       []sdk.Alert{{ID: "github-auth", Severity: sdk.SeverityWarning, Message: msg}},
 			RefreshAfter: httphealth.DefaultRefreshAfter(httphealth.HealthAuthReq, body.RetryAfter),
 			Health:       httphealth.HealthAuthReq,
-		}
-	}
-
-	if body.StatusCode == http.StatusTooManyRequests {
-		msg := "GitHub API rate limited"
-		return sdk.Snapshot{
-			PluginID: pluginID,
-			State:    sdk.StateDegraded,
-			Summary: sdk.Summary{
-				Title: "GitHub", Value: "Rate limited", Trend: sdk.TrendSteady,
-				Severity: sdk.SeverityWarning, IconHint: "pull-request",
-			},
-			Items:        []sdk.Item{},
-			Actions:      []sdk.Action{},
-			Alerts:       []sdk.Alert{{ID: "github-rate-limit", Severity: sdk.SeverityWarning, Message: msg}},
-			RefreshAfter: httphealth.DefaultRefreshAfter(httphealth.HealthRateLimited, body.RetryAfter),
-			Health:       httphealth.HealthRateLimited,
 		}
 	}
 
@@ -339,13 +397,15 @@ func (p *githubPlugin) buildSnapshot() sdk.Snapshot {
 		value = "No reviews"
 	}
 
-	items := make([]sdk.Item, 0, 3)
+	// Rebuild the action lookup from the current snapshot so it stays bounded.
+	p.prMetaMap = make(map[string]prMeta, maxDisplayItems)
+	items := make([]sdk.Item, 0, maxDisplayItems)
 	for _, pr := range itemsData {
-		if len(items) >= 3 {
+		if len(items) >= maxDisplayItems {
 			break
 		}
-		repo := strings.TrimPrefix(pr.RepositoryURL, apiBase+"/repos/")
-		itemID := fmt.Sprintf("pr-%d", pr.Number)
+		repo := p.repoName(pr)
+		itemID := prItemID(pr)
 		p.prMetaMap[itemID] = prMeta{
 			number: pr.Number,
 			repo:   repo,
@@ -387,17 +447,42 @@ func (p *githubPlugin) buildSnapshot() sdk.Snapshot {
 	}
 }
 
+// prItemID returns a stable, globally unique item id. PR numbers alone collide
+// across repositories, so the search API's global issue id is used.
+func prItemID(pr ghPR) string {
+	if pr.ID != 0 {
+		return fmt.Sprintf("pr-%d", pr.ID)
+	}
+	return fmt.Sprintf("pr-%d", pr.Number)
+}
+
+func (p *githubPlugin) repoName(pr ghPR) string {
+	repo := strings.TrimPrefix(pr.RepositoryURL, p.apiBaseURL()+"/repos/")
+	return strings.TrimPrefix(repo, apiBase+"/repos/")
+}
+
 func (p *githubPlugin) emitDeltaEvents(items []ghPR, reviewCount int) {
 	currentPRs := make(map[string]prevPRInfo)
 	for _, pr := range items {
-		key := fmt.Sprintf("pr-%d", pr.Number)
-		currentPRs[key] = prevPRInfo{title: pr.Title, url: pr.HTMLURL}
+		currentPRs[prItemID(pr)] = prevPRInfo{title: pr.Title, url: pr.HTMLURL}
+	}
+
+	// Only items fetched in this page are known; when the backlog exceeds the
+	// page, PRs missing from it may simply have been pushed out, so don't
+	// report them as completed.
+	complete := len(items) >= reviewCount
+
+	if !p.seeded {
+		p.prevPRs = currentPRs
+		p.prevReviewCount = reviewCount
+		p.seeded = true
+		return
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	for key, info := range p.prevPRs {
-		if _, still := currentPRs[key]; !still {
+		if _, still := currentPRs[key]; !still && complete {
 			sdk.Emit(sdk.Event{
 				Type:      "pr.review_completed",
 				PluginID:  pluginID,
@@ -410,7 +495,7 @@ func (p *githubPlugin) emitDeltaEvents(items []ghPR, reviewCount int) {
 	}
 
 	for key, info := range currentPRs {
-		if _, was := p.prevPRs[key]; !was && len(p.prevPRs) > 0 {
+		if _, was := p.prevPRs[key]; !was {
 			sdk.Emit(sdk.Event{
 				Type:      "pr.review_requested",
 				PluginID:  pluginID,
@@ -422,7 +507,7 @@ func (p *githubPlugin) emitDeltaEvents(items []ghPR, reviewCount int) {
 		}
 	}
 
-	if reviewCount != p.prevReviewCount && len(p.prevPRs) > 0 {
+	if reviewCount != p.prevReviewCount {
 		if reviewCount > p.prevReviewCount {
 			sdk.Emit(sdk.Event{
 				Type:     "pr.count_increased",
@@ -450,6 +535,14 @@ func (p *githubPlugin) emitDeltaEvents(items []ghPR, reviewCount int) {
 		}
 	}
 
+	if !complete {
+		// Remember PRs that fell off the page so they don't re-fire later.
+		for key, info := range p.prevPRs {
+			if _, ok := currentPRs[key]; !ok {
+				currentPRs[key] = info
+			}
+		}
+	}
 	p.prevPRs = currentPRs
 	p.prevReviewCount = reviewCount
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,10 @@ const (
 	pluginVersion = "0.1.2"
 	defaultMax    = 10
 	searchMax     = 25
+
+	// Docs activity is not urgent; polling every 2 minutes mostly burned
+	// Atlassian rate-limit budget for no visible change.
+	activityRefreshAfter = 300
 )
 
 type handler struct {
@@ -176,7 +181,8 @@ func (h *handler) GetStatus() sdk.Snapshot {
 		health := sdk.HealthDegraded
 		msg := "Could not reach Confluence: " + err.Error()
 		refresh := 120
-		if apiErr, ok := err.(*apiHTTPError); ok {
+		var apiErr *apiHTTPError
+		if errors.As(err, &apiErr) {
 			health = httphealth.ClassifyHTTPStatus(apiErr.StatusCode)
 			refresh = httphealth.DefaultRefreshAfter(health, apiErr.RetryAfter)
 			if health == httphealth.HealthAuthReq {
@@ -230,13 +236,13 @@ func (h *handler) GetStatus() sdk.Snapshot {
 			Severity: sdk.SeverityInfo,
 			IconHint: "doc",
 		},
-		Items:        items,
+		Items: items,
 		Actions: []sdk.Action{
 			{ID: "searchDocs", Label: "Search Docs"},
 			{ID: "refresh", Label: "Refresh"},
 		},
 		Alerts:       []sdk.Alert{},
-		RefreshAfter: 120,
+		RefreshAfter: activityRefreshAfter,
 		Health:       sdk.HealthOK,
 	}
 }
@@ -357,7 +363,7 @@ func (h *handler) actionSearchDocs(ctx context.Context, query string) (bool, str
 	}
 
 	pages, err := h.searchContent(ctx, buildSearchCQL(query, space), limit)
-	if err != nil {
+	if err != nil && !isAuthOrRateLimit(err) {
 		// Fallback without siteSearch for Server/DC that may not support it.
 		fallback := fmt.Sprintf(`type in (page,blogpost) AND (title ~ "%s" OR text ~ "%s") order by lastmodified desc`, escapeCQLString(query), escapeCQLString(query))
 		if space != "" {
@@ -365,9 +371,9 @@ func (h *handler) actionSearchDocs(ctx context.Context, query string) (bool, str
 		}
 		sdk.Log("searchDocs primary failed (%v); trying fallback CQL", err)
 		pages, err = h.searchContent(ctx, fallback, limit)
-		if err != nil {
-			return false, err.Error()
-		}
+	}
+	if err != nil {
+		return false, userFacingError(err)
 	}
 	if len(pages) == 0 {
 		return true, "No pages found."
@@ -393,7 +399,7 @@ func (h *handler) actionSearchDocs(ctx context.Context, query string) (bool, str
 func (h *handler) actionGetPageDetails(ctx context.Context, pageID string) (bool, string) {
 	page, err := h.fetchPage(ctx, pageID)
 	if err != nil {
-		return false, err.Error()
+		return false, userFacingError(err)
 	}
 
 	var lines []string
@@ -419,14 +425,80 @@ func (h *handler) actionGetPageDetails(ctx context.Context, pageID string) (bool
 
 // --- HTTP / API ---
 
+// apiHTTPError carries only the status and a short server-provided message;
+// raw response bodies are never kept so they cannot leak into logs or alerts.
 type apiHTTPError struct {
 	StatusCode int
 	RetryAfter int
-	Body       string
+	Message    string
 }
 
 func (e *apiHTTPError) Error() string {
-	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
+	if e.Message != "" {
+		return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("HTTP %d", e.StatusCode)
+}
+
+func newAPIHTTPError(resp *http.Response, body []byte) *apiHTTPError {
+	return &apiHTTPError{
+		StatusCode: resp.StatusCode,
+		RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After")),
+		Message:    apiErrorMessage(body),
+	}
+}
+
+// apiErrorMessage extracts Confluence's JSON "message" field (e.g. CQL syntax
+// errors) and drops anything else (HTML error pages, stack traces).
+func apiErrorMessage(body []byte) string {
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return truncate(strings.TrimSpace(payload.Message), 200)
+}
+
+func isAuthOrRateLimit(err error) bool {
+	var apiErr *apiHTTPError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	h := httphealth.ClassifyHTTPStatus(apiErr.StatusCode)
+	return h == httphealth.HealthAuthReq || h == httphealth.HealthRateLimited
+}
+
+func userFacingError(err error) string {
+	var apiErr *apiHTTPError
+	if errors.As(err, &apiErr) {
+		switch httphealth.ClassifyHTTPStatus(apiErr.StatusCode) {
+		case httphealth.HealthAuthReq:
+			return "Confluence authentication failed — reconnect in Settings"
+		case httphealth.HealthRateLimited:
+			return "Confluence API rate limited"
+		}
+	}
+	return err.Error()
+}
+
+// loginRedirected reports whether a 2xx response is really a login page or an
+// anonymous fallback (expired browser session) rather than API JSON.
+func loginRedirected(resp *http.Response) bool {
+	switch resp.Header.Get("X-Seraph-LoginReason") {
+	case "AUTHENTICATED_FAILED", "AUTHENTICATION_DENIED":
+		return true
+	}
+	if resp.Request != nil && resp.Request.URL != nil {
+		u := resp.Request.URL
+		host := strings.ToLower(u.Hostname())
+		path := strings.ToLower(u.Path)
+		if host == "id.atlassian.com" || strings.Contains(path, "/login") {
+			return true
+		}
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	return strings.Contains(ct, "text/html")
 }
 
 func (h *handler) resolveAPIBase(ctx context.Context) (string, error) {
@@ -470,17 +542,13 @@ func (h *handler) resolveCloudID(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if resp.StatusCode >= 400 {
-		return "", &apiHTTPError{
-			StatusCode: resp.StatusCode,
-			RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After")),
-			Body:       strings.TrimSpace(string(body)),
-		}
+		return "", newAPIHTTPError(resp, body)
 	}
 
 	var resources []struct {
-		ID   string   `json:"id"`
-		URL  string   `json:"url"`
-		Name string   `json:"name"`
+		ID     string   `json:"id"`
+		URL    string   `json:"url"`
+		Name   string   `json:"name"`
 		Scopes []string `json:"scopes"`
 	}
 	if err := json.Unmarshal(body, &resources); err != nil {
@@ -519,11 +587,13 @@ func (h *handler) doGET(ctx context.Context, apiURL string) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, &apiHTTPError{
-			StatusCode: resp.StatusCode,
-			RetryAfter: httphealth.ParseRetryAfter(resp.Header.Get("Retry-After")),
-			Body:       truncate(strings.TrimSpace(string(body)), 512),
-		}
+		return nil, newAPIHTTPError(resp, body)
+	}
+	if loginRedirected(resp) {
+		// Expired cookie/session: Atlassian redirects to an HTML login page
+		// (200) instead of returning 401, which used to surface as a JSON
+		// parse error.
+		return nil, &apiHTTPError{StatusCode: http.StatusUnauthorized, Message: "session expired (login page returned)"}
 	}
 	return body, nil
 }
@@ -534,20 +604,20 @@ type contentSearchResponse struct {
 }
 
 type contentResult struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Title   string `json:"title"`
-	Excerpt string `json:"excerpt"`
-	URL     string `json:"url"`
+	ID      string         `json:"id"`
+	Type    string         `json:"type"`
+	Title   string         `json:"title"`
+	Excerpt string         `json:"excerpt"`
+	URL     string         `json:"url"`
 	Content *contentResult `json:"content"` // nested in /search hits
 	Space   *struct {
 		Key  string `json:"key"`
 		Name string `json:"name"`
 	} `json:"space"`
 	Version *struct {
-		Number    int    `json:"number"`
-		When      string `json:"when"`
-		By        *struct {
+		Number int    `json:"number"`
+		When   string `json:"when"`
+		By     *struct {
 			DisplayName string `json:"displayName"`
 		} `json:"by"`
 	} `json:"version"`
@@ -594,14 +664,17 @@ func (h *handler) searchContent(ctx context.Context, cql string, limit int) ([]c
 	body, err := h.doGET(ctx, searchURL)
 	if err == nil {
 		pages, parseErr := h.parseSearchBody(body)
-		if parseErr == nil && len(pages) > 0 {
+		if parseErr == nil {
+			// An empty result is a valid answer; re-running the same CQL
+			// against /content/search only doubled latency for quiet feeds.
 			return pages, nil
 		}
-		// Empty or unexpected shape — try content/search below.
-		if parseErr != nil {
-			sdk.Log("parse /search body: %v", parseErr)
-		}
+		sdk.Log("parse /search body: %v", parseErr)
 	} else {
+		if isAuthOrRateLimit(err) {
+			// The fallback would fail the same way; don't double the wait.
+			return nil, err
+		}
 		sdk.Log("/search failed: %v", err)
 	}
 
@@ -624,7 +697,12 @@ func (h *handler) parseSearchBody(body []byte) ([]confluencePage, error) {
 	}
 	pages := make([]confluencePage, 0, len(resp.Results))
 	for _, r := range resp.Results {
-		pages = append(pages, h.mapResult(flattenSearchHit(r)))
+		p := h.mapResult(flattenSearchHit(r))
+		if p.ID == "" {
+			// Non-content hits (spaces, users) have no stable page id.
+			continue
+		}
+		pages = append(pages, p)
 	}
 	return pages, nil
 }
@@ -684,7 +762,7 @@ func (h *handler) mapResult(r contentResult) confluencePage {
 	if r.Version != nil {
 		p.Version = r.Version.Number
 		if r.Version.When != "" {
-			p.LastModified = r.Version.When
+			p.LastModified = normalizeTimestamp(r.Version.When)
 		}
 		if r.Version.By != nil {
 			p.LastUpdater = r.Version.By.DisplayName
@@ -692,7 +770,7 @@ func (h *handler) mapResult(r contentResult) confluencePage {
 	}
 	if r.History != nil && r.History.LastUpdated != nil {
 		if r.History.LastUpdated.When != "" {
-			p.LastModified = r.History.LastUpdated.When
+			p.LastModified = normalizeTimestamp(r.History.LastUpdated.When)
 		}
 		if r.History.LastUpdated.By != nil && r.History.LastUpdated.By.DisplayName != "" {
 			p.LastUpdater = r.History.LastUpdated.By.DisplayName
@@ -757,10 +835,16 @@ func (h *handler) emitDeltas(pages []confluencePage) {
 			"relatedIssueKeys": info.keys,
 		}
 		if !ok {
+			// A page newly entering the "recently modified" window is usually
+			// an edit of an older page; only version 1 is really new.
+			eventType, msg := "page.created", fmt.Sprintf("New page: %s", info.title)
+			if info.version > 1 {
+				eventType, msg = "page.updated", fmt.Sprintf("Updated: %s", info.title)
+			}
 			sdk.Emit(sdk.Event{
-				Type:     "page.created",
+				Type:     eventType,
 				PluginID: pluginID,
-				Message:  fmt.Sprintf("New page: %s", info.title),
+				Message:  msg,
 				Severity: sdk.SeverityInfo,
 				Data:     data,
 			})

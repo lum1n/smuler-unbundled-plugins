@@ -149,3 +149,53 @@ func mustReadArchive(t *testing.T, archive string, names ...string) ([]byte, []b
 	}
 	return out[0], out[1]
 }
+
+func TestGenerateKeyRefusesOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(path, []byte("existing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := generateKey(path); err == nil {
+		t.Fatal("expected refusal to overwrite existing key")
+	}
+	if b, _ := os.ReadFile(path); string(b) != "existing\n" {
+		t.Fatalf("key was modified: %q", b)
+	}
+}
+
+func TestWriteTarGzOmitsOwnerNames(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "demo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "manifest.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(dir, "out.tar.gz")
+	if err := writeTarGz(archive, root, "demo"); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Uname != "" || hdr.Gname != "" || hdr.Uid != 0 || hdr.Gid != 0 {
+			t.Fatalf("%s carries owner info: %q/%q %d/%d", hdr.Name, hdr.Uname, hdr.Gname, hdr.Uid, hdr.Gid)
+		}
+	}
+}

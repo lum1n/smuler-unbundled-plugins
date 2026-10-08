@@ -14,13 +14,14 @@ First-party plugin for GitHub Actions and CI workflow signals.
 Long-lived JSON-RPC process over stdio. Written in Go.
 
 ### Initialize
-Receives the GitHub token via `params.providerAuths[].accountId` (populated from macOS Keychain by the host).
+Receives the GitHub token via `params.providerAuths[].accessToken` / `apiKey`, falling back to the legacy `params.auth.accountId` (populated from macOS Keychain by the host).
 
 ### getStatus / refresh
-1. Fetches the authenticated user's repositories via `GET /user/repos?sort=pushed`
-2. For each repo, fetches recent failing workflow runs via `GET /repos/{owner}/{repo}/actions/runs?status=failure`
-3. Fetches run concurrently (up to 5 repos at a time) to stay responsive
-4. Reports:
+1. Fetches the authenticated user's repositories via `GET /user/repos?sort=pushed` and skips repos not pushed in the last 14 days
+2. For each remaining repo, fetches the 20 most recent workflow runs via `GET /repos/{owner}/{repo}/actions/runs`
+3. A workflow/branch counts as failing only when its latest completed run (within 14 days) failed, timed out, or failed to start
+4. Fetches runs concurrently (up to 8 repos at a time) with conditional requests (`If-None-Match`), under a 25s overall budget
+5. Reports:
    - Count of failing workflows
    - Up to 10 most recent failures with repo, branch, and deep link
    - Critical alert when failures are present

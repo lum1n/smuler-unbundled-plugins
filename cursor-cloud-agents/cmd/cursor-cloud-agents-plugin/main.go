@@ -33,6 +33,9 @@ type handler struct {
 
 	prevRunStatus map[string]string
 	userLabel     string
+	// itemURLs maps item IDs from the last snapshot to their agent URLs; the
+	// host sends item actions with payload {"id": itemID}, not the URL.
+	itemURLs map[string]string
 }
 
 func main() {
@@ -48,6 +51,7 @@ func (h *handler) Initialize(params sdk.InitializeParams) string {
 
 	h.apiKey = extractAPIKey(params)
 	h.client.SetAPIKey(h.apiKey)
+	h.userLabel = ""
 
 	h.refreshSeconds = parseInt(params.Config["refreshSeconds"], 60)
 	h.maxAgents = parseInt(params.Config["maxAgents"], 20)
@@ -70,6 +74,7 @@ func (h *handler) GetStatus() sdk.Snapshot {
 	maxAgents := h.maxAgents
 	includeArchived := h.includeArchived
 	detailLevel := h.detailLevel
+	userLabel := h.userLabel
 	h.mu.Unlock()
 
 	if apiKey == "" {
@@ -79,15 +84,18 @@ func (h *handler) GetStatus() sdk.Snapshot {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	me, err := h.client.Me(ctx)
-	if err != nil {
-		return errorSnapshot(err, refreshSeconds)
+	// The account label never changes for a key; fetch it once instead of
+	// adding a serial round trip to every refresh.
+	if userLabel == "" {
+		me, err := h.client.Me(ctx)
+		if err != nil {
+			return errorSnapshot(err, refreshSeconds)
+		}
+		userLabel = formatUserLabel(me)
+		h.mu.Lock()
+		h.userLabel = userLabel
+		h.mu.Unlock()
 	}
-
-	userLabel := formatUserLabel(me)
-	h.mu.Lock()
-	h.userLabel = userLabel
-	h.mu.Unlock()
 
 	agents, err := h.client.ListAllAgents(ctx, cursorapi.ListOptions{
 		IncludeArchived: includeArchived,
@@ -120,9 +128,14 @@ func (h *handler) GetStatus() sdk.Snapshot {
 	h.emitRunTransitions(enriched)
 
 	items := make([]sdk.Item, 0, len(enriched))
+	itemURLs := make(map[string]string, len(enriched))
 	for _, agent := range enriched {
 		items = append(items, agentToItem(agent))
+		itemURLs[agent.List.ID] = agent.List.URL
 	}
+	h.mu.Lock()
+	h.itemURLs = itemURLs
+	h.mu.Unlock()
 
 	running, errors := countRunStates(agents, enriched, detailLevel)
 	total := len(agents)
@@ -159,6 +172,11 @@ func (h *handler) PerformAction(id string, params map[string]string) (bool, stri
 		return true, ""
 	case "open":
 		url := params["url"]
+		if url == "" {
+			h.mu.Lock()
+			url = h.itemURLs[params["id"]]
+			h.mu.Unlock()
+		}
 		if url == "" {
 			return false, "missing url"
 		}
@@ -323,8 +341,10 @@ func errorSnapshot(err error, refreshAfter int) sdk.Snapshot {
 		}
 		if apiErr.IsRateLimited() {
 			health = sdk.HealthRateLimited
-			if refresh > 120 {
-				refresh = 120
+			// Back off at least as long as the server asks; never poll
+			// faster while rate limited.
+			if apiErr.RetryAfter > refresh {
+				refresh = apiErr.RetryAfter
 			}
 		}
 	}
@@ -596,8 +616,9 @@ func firstPRURL(agent cursorapi.EnrichedAgent) string {
 
 func truncate(s string, max int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
-	return s[:max-1] + "…"
+	return string(r[:max-1]) + "…"
 }

@@ -9,13 +9,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
-	issueKeyPattern      = regexp.MustCompile(`\b([A-Z][A-Z0-9_]+-\d+)\b`)
-	pageIDFromURL        = regexp.MustCompile(`(?:/pages/(\d+)|[?&]pageId=(\d+))`)
-	digitsOnlyPageID     = regexp.MustCompile(`\d{5,}`)
-	voiceSearchPrefix    = regexp.MustCompile(`(?i)^\s*(?:(?:please\s+)?(?:search|find|look\s*up|show|get|open)\s+)?(?:(?:in\s+|on\s+|from\s+)?(?:confluence|docs?|documentation)\s+)?(?:(?:for|about|regarding)\s+)?(.+?)\s*$`)
+	issueKeyPattern   = regexp.MustCompile(`\b([A-Z][A-Z0-9_]+-\d+)\b`)
+	pageIDFromURL     = regexp.MustCompile(`(?:/pages/(\d+)|[?&]pageId=(\d+))`)
+	digitsOnlyPageID  = regexp.MustCompile(`\d{5,}`)
+	voiceSearchPrefix = regexp.MustCompile(`(?i)^\s*(?:(?:please\s+)?(?:search|find|look\s*up|show|get|open)\s+)?(?:(?:in\s+|on\s+|from\s+)?(?:confluence|docs?|documentation)\s+)?(?:(?:for|about|regarding)\s+)?(.+?)\s*$`)
 )
 
 type confluenceAuth struct {
@@ -30,6 +31,21 @@ func (a confluenceAuth) hasAuth() bool {
 }
 
 func (a confluenceAuth) apply(req *http.Request) {
+	// Honor the selected kind first: when several providers are connected,
+	// resolveAPIBase routes by Kind (OAuth → api.atlassian.com gateway), so
+	// sending Basic credentials there would always 401.
+	switch a.Kind {
+	case "oauth":
+		if a.AccessToken != "" {
+			req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+			return
+		}
+	case "browser_import":
+		if a.CookieHeader != "" {
+			req.Header.Set("Cookie", a.CookieHeader)
+			return
+		}
+	}
 	switch {
 	case a.APIKey != "":
 		parts := strings.SplitN(a.APIKey, ":", 2)
@@ -315,6 +331,22 @@ func normalizeSearchQuery(raw string) string {
 		lower := strings.ToLower(trimmed)
 		if trimmed != "" && lower != "confluence" && lower != "docs" && lower != "documentation" && lower != "doc" {
 			return trimmed
+		}
+	}
+	return raw
+}
+
+// normalizeTimestamp converts Confluence timestamps ("2024-01-01T10:00:00.000+01:00")
+// to RFC3339 UTC so the host parses them and lexicographic sorting is correct
+// across offsets. Unparseable values are passed through unchanged.
+func normalizeTimestamp(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.000-0700", "2006-01-02T15:04:05-0700"} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t.UTC().Format(time.RFC3339)
 		}
 	}
 	return raw

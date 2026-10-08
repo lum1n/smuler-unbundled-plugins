@@ -2,19 +2,23 @@ package internal
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // GenericContextReader extracts repo/branch/cwd context directly via git.
-type GenericContextReader struct{}
+// Results are cached per working directory for a short time: running four git
+// commands per agent on every refresh was a major source of latency.
+type GenericContextReader struct {
+	repoCache *ttlCache[AgentSession]
+}
 
 // NewGenericContextReader creates a new generic context reader.
 func NewGenericContextReader() *GenericContextReader {
-	return &GenericContextReader{}
+	return &GenericContextReader{repoCache: newTTLCache[AgentSession](10 * time.Second)}
 }
 
 // ContextForPID returns generic repository context for the given process.
@@ -27,6 +31,19 @@ func (r *GenericContextReader) ContextForPID(pid int) AgentSession {
 		return AgentSession{}
 	}
 
+	if r.repoCache != nil {
+		if ctx, ok := r.repoCache.get(cwd); ok {
+			return ctx
+		}
+	}
+	ctx := r.repoContext(cwd)
+	if r.repoCache != nil {
+		r.repoCache.set(cwd, ctx)
+	}
+	return ctx
+}
+
+func (r *GenericContextReader) repoContext(cwd string) AgentSession {
 	ctx := AgentSession{CWD: cwd, Available: true}
 	repoRoot := runCommand("git", "-C", cwd, "rev-parse", "--show-toplevel")
 	if repoRoot == "" {
@@ -50,9 +67,25 @@ func (r *GenericContextReader) ContextForPID(pid int) AgentSession {
 	return ctx
 }
 
+// cwdCache memoizes process working directories; on macOS each lookup is an
+// lsof exec, and several readers ask for the same pid during one refresh.
+var cwdCache = newTTLCache[string](15 * time.Second)
+
 func cwdForPID(pid int) string {
+	key := strconv.Itoa(pid)
+	if cwd, ok := cwdCache.get(key); ok {
+		return cwd
+	}
+	cwd := lookupCWD(pid)
+	if cwd != "" {
+		cwdCache.set(key, cwd)
+	}
+	return cwd
+}
+
+func lookupCWD(pid int) string {
 	if runtime.GOOS == "darwin" {
-		out, err := exec.Command("lsof", "-p", strconv.Itoa(pid), "-a", "-d", "cwd", "-Fn").Output()
+		out, err := commandOutput("lsof", "-p", strconv.Itoa(pid), "-a", "-d", "cwd", "-Fn")
 		if err != nil {
 			return ""
 		}
@@ -72,7 +105,7 @@ func cwdForPID(pid int) string {
 }
 
 func runCommand(name string, args ...string) string {
-	out, err := exec.Command(name, args...).Output()
+	out, err := commandOutput(name, args...)
 	if err != nil {
 		return ""
 	}
