@@ -16,7 +16,8 @@ Implementation notes:
 - Requires host-level credential management (OAuth, API keys, browser sessions) except Claude (Claude Code login fallback), Gemini (CLI creds fallback) and Kiro (`kiro-cli`)
 
 Claude:
-- Reads plan usage from `GET https://api.anthropic.com/api/oauth/usage` (header `anthropic-beta: oauth-2025-04-20`), which needs a Claude.ai OAuth token with the `user:profile` scope.
+- Reads plan usage from `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1` (header `anthropic-beta: oauth-2025-04-20`), which needs a Claude.ai OAuth token with the `user:profile` scope.
+- Sends Claude Code's User-Agent format, `claude-cli/<installed version> (external, cli)` (version from `claude --version`, like CodexBar); the endpoint rate-limits other clients aggressively. Override with `SMULER_CLAUDE_USER_AGENT`.
 - Token source: a token pasted in Settings, else Claude Code's stored login (`$CLAUDE_CONFIG_DIR/.credentials.json`, `~/.claude/.credentials.json`, then the macOS Keychain item `Claude Code-credentials`; macOS may ask once to allow access).
 - The plugin never refreshes Claude Code's tokens (refresh tokens rotate; refreshing without writing back would sign Claude Code out). If the stored token is expired, run `claude` once.
 - The usage endpoint rate-limits aggressively: results are cached for 60s and 429s back off (Retry-After or 1–16 min, capped at 15 min) while serving the last reading.

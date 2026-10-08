@@ -41,7 +41,8 @@ import (
 // auth_required.
 
 const (
-	claudeDefaultUsageURL = "https://api.anthropic.com/api/oauth/usage"
+	// cedar_ember=1 matches what Claude Code and CodexBar request.
+	claudeDefaultUsageURL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1"
 	claudeOAuthBetaHeader = "oauth-2025-04-20"
 	claudeKeychainService = "Claude Code-credentials"
 	claudeDeepLink        = "https://claude.ai/settings/usage"
@@ -54,12 +55,20 @@ const (
 	// every refresh after it failed.
 	claudeLocalRetryInterval = 5 * time.Minute
 	claudeKeychainTimeout    = 10 * time.Second
+	claudeVersionTimeout     = 5 * time.Second
+	// Used when the installed Claude Code version can't be detected.
+	claudeFallbackCLIVersion = "2.1.80"
 	claudeExpirySkew         = 60 * time.Second
 )
 
 var (
-	claudeUsageURL  = claudeDefaultUsageURL
-	claudeUserAgent = getEnvOrDefault("SMULER_CLAUDE_USER_AGENT", "smuler-ai-provider-plugin/0.1.3")
+	claudeUsageURL = claudeDefaultUsageURL
+	// claudeUserAgentOnce resolves the User-Agent lazily (after initialize has
+	// set claudeHomeDir, which the version probe needs to find the binary).
+	claudeUserAgentOnce  sync.Once
+	claudeUserAgentValue string
+	// claudeVersionProbe is swappable for tests.
+	claudeVersionProbe = detectClaudeCLIVersion
 	// claudeHomeDir is set from host.realHome during initialize.
 	claudeHomeDir string
 	// claudeKeychainReader is swappable for tests.
@@ -411,6 +420,79 @@ func (p *claudeProvider) resolveCredentials(ctx context.Context, auth AuthContex
 	return local, nil
 }
 
+// claudeUserAgent returns the User-Agent for the usage endpoint. The endpoint
+// rate-limits non-Claude-Code clients aggressively, so like CodexBar we send
+// Claude Code's own format with the installed CLI version:
+// "claude-cli/<version> (external, cli)". SMULER_CLAUDE_USER_AGENT overrides it.
+func claudeUserAgent() string {
+	claudeUserAgentOnce.Do(func() {
+		if ua := strings.TrimSpace(os.Getenv("SMULER_CLAUDE_USER_AGENT")); ua != "" {
+			claudeUserAgentValue = ua
+			return
+		}
+		version := claudeVersionProbe()
+		if version == "" {
+			version = claudeFallbackCLIVersion
+		}
+		claudeUserAgentValue = "claude-cli/" + version + " (external, cli)"
+	})
+	return claudeUserAgentValue
+}
+
+// detectClaudeCLIVersion runs `claude --version` (output like
+// "2.1.80 (Claude Code)") and returns the version, or "" if unavailable.
+// GUI-launched processes have a minimal PATH, so common install locations are
+// probed as well.
+func detectClaudeCLIVersion() string {
+	candidates := []string{}
+	if path, err := exec.LookPath("claude"); err == nil {
+		candidates = append(candidates, path)
+	}
+	if claudeHomeDir != "" {
+		candidates = append(candidates,
+			filepath.Join(claudeHomeDir, ".local", "bin", "claude"),
+			filepath.Join(claudeHomeDir, ".claude", "local", "claude"),
+		)
+	}
+	candidates = append(candidates, "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
+
+	for _, bin := range candidates {
+		if info, err := os.Stat(bin); err != nil || info.IsDir() {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), claudeVersionTimeout)
+		cmd := exec.CommandContext(ctx, bin, "--version")
+		cmd.WaitDelay = time.Second
+		out, err := cmd.Output()
+		cancel()
+		if err != nil {
+			continue
+		}
+		if v := parseClaudeCLIVersion(string(out)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// parseClaudeCLIVersion extracts "2.1.80" from "2.1.80 (Claude Code)".
+func parseClaudeCLIVersion(out string) string {
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) == 0 {
+		return ""
+	}
+	v := strings.TrimPrefix(fields[0], "v")
+	for _, r := range v {
+		if (r < '0' || r > '9') && r != '.' {
+			return ""
+		}
+	}
+	if !strings.Contains(v, ".") {
+		return ""
+	}
+	return v
+}
+
 type claudeHTTPResult struct {
 	status     int
 	body       []byte
@@ -426,7 +508,7 @@ func claudeFetchUsage(ctx context.Context, token string) (claudeHTTPResult, erro
 	req.Header.Set("anthropic-beta", claudeOAuthBetaHeader)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", claudeUserAgent)
+	req.Header.Set("User-Agent", claudeUserAgent())
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
