@@ -32,11 +32,12 @@ func claudeCredsJSON(token string, expiresAt time.Time, scopes ...string) string
 }
 
 type claudeTestEnv struct {
-	home     string
-	hits     atomic.Int32
-	handler  func(w http.ResponseWriter, r *http.Request)
-	provider *claudeProvider
-	now      time.Time
+	home      string
+	hits      atomic.Int32
+	handler   func(w http.ResponseWriter, r *http.Request)
+	provider  *claudeProvider
+	now       time.Time
+	serverURL string
 }
 
 func newClaudeTestEnv(t *testing.T) *claudeTestEnv {
@@ -49,13 +50,17 @@ func newClaudeTestEnv(t *testing.T) *claudeTestEnv {
 	}))
 	t.Cleanup(srv.Close)
 
-	oldURL, oldHome, oldKeychain := claudeUsageURL, claudeHomeDir, claudeKeychainReader
+	oldURL, oldHome, oldKeychain, oldProfile := claudeUsageURL, claudeHomeDir, claudeKeychainReader, claudeProfileURL
 	claudeUsageURL = srv.URL + "/api/oauth/usage"
+	claudeProfileURL = "" // enabled explicitly by tests that need it
+	env.serverURL = srv.URL
 	claudeHomeDir = env.home
 	claudeKeychainReader = func(context.Context) ([]byte, error) { return nil, errClaudeNoCredentials }
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("SMULER_CLAUDE_USER_AGENT", "")
-	t.Cleanup(func() { claudeUsageURL, claudeHomeDir, claudeKeychainReader = oldURL, oldHome, oldKeychain })
+	t.Cleanup(func() {
+		claudeUsageURL, claudeHomeDir, claudeKeychainReader, claudeProfileURL = oldURL, oldHome, oldKeychain, oldProfile
+	})
 	resetClaudeUserAgent(t, func() string { return "2.1.80" })
 	return env
 }

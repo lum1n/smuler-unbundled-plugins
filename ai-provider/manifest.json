@@ -1,7 +1,7 @@
 {
   "id": "ai-provider",
   "name": "AI Providers",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Usage limits and quota tracking for AI coding providers",
   "icon": {
     "type": "sfSymbol",
