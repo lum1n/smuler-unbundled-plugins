@@ -4,7 +4,8 @@ First-party plugin for AI coding provider usage limits and quota tracking.
 
 Current responsibilities:
 - Usage tracking for seventeen AI providers: Augment, Claude, Codex, Command Code, Copilot, Cursor, Devin, Factory, Gemini, Grok, Kiro, OpenCode, OpenCode Go, OpenRouter, Warp, Windsurf, and Zed
-- One card per provider in the dropdown
+- One card per distinct account (records sharing a credential, or the same Claude Code login, collapse into one card); the subtitle is the account (email/login from the provider API, else the Settings label, else "Account N")
+- Usage gauges per window (e.g. Claude Session/Weekly, OpenCode Go Rolling/Weekly/Monthly, credit balances as "$used / $total"), colored by the configured thresholds
 - Menubar summary showing the provider closest to its usage limit
 - Threshold-based alerts at 75% (warning) and 90% (critical)
 - Deep links to provider usage/billing pages
@@ -20,6 +21,7 @@ Claude:
 - Sends Claude Code's User-Agent format, `claude-cli/<installed version> (external, cli)` (version from `claude --version`, like CodexBar); the endpoint rate-limits other clients aggressively. Override with `SMULER_CLAUDE_USER_AGENT`.
 - Token source: a token pasted in Settings, else Claude Code's stored login (`$CLAUDE_CONFIG_DIR/.credentials.json`, `~/.claude/.credentials.json`, then the macOS Keychain item `Claude Code-credentials`; macOS may ask once to allow access).
 - The plugin never refreshes Claude Code's tokens (refresh tokens rotate; refreshing without writing back would sign Claude Code out). If the stored token is expired, run `claude` once.
+- The account email for the card subtitle comes from `GET https://api.anthropic.com/api/oauth/profile` (same headers), fetched once per token and cached.
 - The usage endpoint rate-limits aggressively: results are cached for 60s and 429s back off (Retry-After or 1–16 min, capped at 15 min) while serving the last reading.
 
 Providers are declared in `manifest.json` under `authProviders` (OAuth, API key, browser session / cookie import, etc.) and appear in Settings. Connect a provider there to enable it.

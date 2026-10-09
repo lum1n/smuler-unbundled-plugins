@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -359,5 +360,22 @@ func TestParsePerformActionParams(t *testing.T) {
 	}`))
 	if actionID != "searchDocs" || payload["query"] != "vacation policy" {
 		t.Fatalf("top-level query: action=%q payload=%v", actionID, payload)
+	}
+}
+
+func TestItemGaugesJSON(t *testing.T) {
+	item := Item{ID: "claude", Title: "Claude", Severity: SeverityInfo, Gauges: []Gauge{
+		{ID: "session", Label: "Session", Value: 0.33, Caption: "resets in 2h"},
+	}}
+	b, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"gauges":[{"id":"session","label":"Session","value":0.33,"caption":"resets in 2h"}]`) {
+		t.Fatalf("unexpected JSON: %s", b)
+	}
+	b, _ = json.Marshal(Item{ID: "x", Title: "X", Severity: SeverityInfo})
+	if strings.Contains(string(b), "gauges") {
+		t.Fatalf("gauges should be omitted when empty: %s", b)
 	}
 }

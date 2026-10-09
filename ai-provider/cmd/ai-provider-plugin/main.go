@@ -37,7 +37,7 @@ var httpClient = &http.Client{
 }
 
 const (
-	pluginVersion = "0.1.3"
+	pluginVersion = "0.1.5"
 	pluginID      = "ai-provider"
 )
 
@@ -69,6 +69,31 @@ type ProviderStatus struct {
 	SummaryValue       string
 	Details            string
 	Timestamp          time.Time
+
+	// AccountIdentity is a human label for the account reported by the
+	// provider API (email, login, workspace), used as the card subtitle.
+	AccountIdentity string
+	// IdentityKey is a stable account identity from the provider API (e.g. an
+	// account UUID). Cards of one provider with the same key are collapsed.
+	IdentityKey string
+	// CredentialKey fingerprints the credential actually used for the fetch
+	// (e.g. Claude's pasted token vs. the local Claude Code login). Cards of
+	// one provider with the same key are collapsed.
+	CredentialKey string
+	// Plan is the subscription/plan name, shown in the card detail.
+	Plan string
+	// Note is non-gauge information shown in the card detail when gauges are
+	// present (Details is used otherwise).
+	Note string
+	// Windows are the usage meters rendered as gauges.
+	Windows []usageWindow
+
+	// Set by buildSnapshot.
+	resultKey    string
+	slot         string
+	noSecret     bool
+	order        int
+	AccountLabel string
 }
 
 type Provider interface {
@@ -241,7 +266,13 @@ func (p *openRouterProvider) Fetch(ctx context.Context, auth AuthContext) (Provi
 		summaryValue = fmt.Sprintf("$%.2f left", remaining)
 	}
 
+	var windows []usageWindow
+	if w, ok := amountWindow("credits", "Credits", used, total, formatUSD, time.Time{}); ok {
+		windows = append(windows, w)
+	}
+
 	return ProviderStatus{
+		Windows:        windows,
 		ProviderID:     "openrouter",
 		DisplayName:    "OpenRouter",
 		UsagePercent:   usagePercent,
@@ -322,8 +353,13 @@ func (p *codexProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderSt
 
 	severity := severityForPercent(usagePercent)
 	summaryValue := fmt.Sprintf("%.0f%%", usagePercent)
+	var windows []usageWindow
+	if w, ok := amountWindow("monthly", "Monthly", usage.TotalUsage, limit, formatUSD, resetAt); ok {
+		windows = append(windows, w)
+	}
 
 	return ProviderStatus{
+		Windows:        windows,
 		ProviderID:     "codex",
 		DisplayName:    "Codex",
 		UsagePercent:   usagePercent,
@@ -696,6 +732,10 @@ func (p *openCodeProvider) Fetch(ctx context.Context, auth AuthContext) (Provide
 	}
 
 	return ProviderStatus{
+		Windows: []usageWindow{
+			newWindow("rolling", "Rolling", rollingPct, resetAtFromSeconds(rollingResetSec)),
+			newWindow("weekly", "Weekly", weeklyPct, resetAtFromSeconds(weeklyResetSec)),
+		},
 		ProviderID:     "opencode",
 		DisplayName:    "OpenCode",
 		UsagePercent:   usagePct,
@@ -709,6 +749,14 @@ func (p *openCodeProvider) Fetch(ctx context.Context, auth AuthContext) (Provide
 		Details:        details,
 		Timestamp:      time.Now().UTC(),
 	}, nil
+}
+
+// resetAtFromSeconds converts a "resets in N seconds" value; 0 means unknown.
+func resetAtFromSeconds(sec int) time.Time {
+	if sec <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(time.Duration(sec) * time.Second)
 }
 
 func opencodeExtractWindow(data map[string]interface{}, kind string) (float64, int) {
@@ -916,7 +964,16 @@ func (p *openCodeGoProvider) Fetch(ctx context.Context, auth AuthContext) (Provi
 		details = fmt.Sprintf("Rolling %.0f%% / Weekly %.0f%% / Monthly %.0f%%", rollingPct, weeklyPct, monthlyPct)
 	}
 
+	windows := []usageWindow{
+		newWindow("rolling", "Rolling", rollingPct, resetAtFromSeconds(rollingResetSec)),
+		newWindow("weekly", "Weekly", weeklyPct, resetAtFromSeconds(weeklyResetSec)),
+	}
+	if monthlyPct > 0 || monthlyResetSec > 0 {
+		windows = append(windows, newWindow("monthly", "Monthly", monthlyPct, resetAtFromSeconds(monthlyResetSec)))
+	}
+
 	return ProviderStatus{
+		Windows:        windows,
 		ProviderID:     "opencode-go",
 		DisplayName:    "OpenCode Go",
 		UsagePercent:   usagePct,
@@ -955,6 +1012,7 @@ type copilotQuotaSnapshots struct {
 type copilotUsageResponse struct {
 	QuotaSnapshots    copilotQuotaSnapshots `json:"quota_snapshots"`
 	CopilotPlan       string                `json:"copilot_plan"`
+	Login             string                `json:"login"`
 	TokenBasedBilling bool                  `json:"token_based_billing"`
 	QuotaResetDate    string                `json:"quota_reset_date"`
 }
@@ -1131,15 +1189,16 @@ func (p *copilotProvider) Fetch(ctx context.Context, auth AuthContext) (Provider
 		secondary = chat
 	} else if usage.TokenBasedBilling {
 		return ProviderStatus{
-			ProviderID:   "copilot",
-			DisplayName:  "Copilot",
-			WindowLabel:  fmt.Sprintf("%s plan", planLabel),
-			Health:       "ready",
-			Severity:     "info",
-			SummaryValue: "Active",
-			Details:      "Token-based billing (no quota meter)",
-			DeepLink:     "https://github.com/settings/copilot",
-			Timestamp:    time.Now().UTC(),
+			AccountIdentity: strings.TrimSpace(usage.Login),
+			ProviderID:      "copilot",
+			DisplayName:     "Copilot",
+			WindowLabel:     fmt.Sprintf("%s plan", planLabel),
+			Health:          "ready",
+			Severity:        "info",
+			SummaryValue:    "Active",
+			Details:         "Token-based billing (no quota meter)",
+			DeepLink:        "https://github.com/settings/copilot",
+			Timestamp:       time.Now().UTC(),
 		}, nil
 	} else {
 		return ProviderStatus{
@@ -1179,19 +1238,50 @@ func (p *copilotProvider) Fetch(ctx context.Context, auth AuthContext) (Provider
 		details = fmt.Sprintf("%s, resets in %s", details, durationUntil(resetAt))
 	}
 
+	var windows []usageWindow
+	var notes []string
+	for _, q := range []struct {
+		id, label string
+		snap      *copilotQuotaSnapshot
+	}{{"premium", "Premium", primary}, {"chat", "Chat", secondary}} {
+		if q.snap == nil || !q.snap.hasUsablePercent() {
+			continue
+		}
+		if q.snap.Unlimited {
+			notes = append(notes, q.label+" unlimited")
+			continue
+		}
+		w := newWindow(q.id, q.label, q.snap.usedPercent(), resetAt)
+		if q.snap.Entitlement > 0 {
+			w.ValueLabel = formatCount(max(0, q.snap.Entitlement-q.snap.Remaining)) + " / " + formatCount(q.snap.Entitlement)
+		}
+		windows = append(windows, w)
+	}
+
+	login := strings.TrimSpace(usage.Login)
+	identityKey := ""
+	if login != "" {
+		identityKey = "login:" + strings.ToLower(copilotNormalizedHost(copilotEnterpriseHost)+"/"+login)
+	}
+
 	return ProviderStatus{
-		ProviderID:     "copilot",
-		DisplayName:    "Copilot",
-		UsagePercent:   usagePct,
-		RemainingLabel: details,
-		WindowLabel:    windowLabel,
-		ResetAt:        resetAt,
-		Severity:       severityForPercent(usagePct),
-		Health:         "ready",
-		DeepLink:       "https://github.com/settings/copilot",
-		SummaryValue:   fmt.Sprintf("%.0f%%", usagePct),
-		Details:        details,
-		Timestamp:      time.Now().UTC(),
+		Windows:         windows,
+		Note:            strings.Join(notes, ", "),
+		Plan:            planLabel,
+		AccountIdentity: login,
+		IdentityKey:     identityKey,
+		ProviderID:      "copilot",
+		DisplayName:     "Copilot",
+		UsagePercent:    usagePct,
+		RemainingLabel:  details,
+		WindowLabel:     windowLabel,
+		ResetAt:         resetAt,
+		Severity:        severityForPercent(usagePct),
+		Health:          "ready",
+		DeepLink:        "https://github.com/settings/copilot",
+		SummaryValue:    fmt.Sprintf("%.0f%%", usagePct),
+		Details:         details,
+		Timestamp:       time.Now().UTC(),
 	}, nil
 }
 
@@ -1416,8 +1506,17 @@ func (p *cursorProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderS
 	}
 
 	accountDetail := ""
-	if userInfo != nil && userInfo.Email != nil && strings.TrimSpace(*userInfo.Email) != "" {
-		accountDetail = strings.TrimSpace(*userInfo.Email)
+	identityKey := ""
+	if userInfo != nil {
+		if userInfo.Email != nil && strings.TrimSpace(*userInfo.Email) != "" {
+			accountDetail = strings.TrimSpace(*userInfo.Email)
+			identityKey = "email:" + strings.ToLower(accountDetail)
+		} else if userInfo.Name != nil {
+			accountDetail = strings.TrimSpace(*userInfo.Name)
+		}
+		if userInfo.Sub != nil && strings.TrimSpace(*userInfo.Sub) != "" {
+			identityKey = "sub:" + strings.TrimSpace(*userInfo.Sub)
+		}
 	}
 
 	details := strings.Join(detailsParts, ", ")
@@ -1425,19 +1524,35 @@ func (p *cursorProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderS
 		details = accountDetail + " · " + details
 	}
 
+	windows := []usageWindow{newWindow("total", "Total", usagePct, resetAt)}
+	if autoPct > 0 {
+		windows = append(windows, newWindow("auto", "Auto", autoPct, resetAt))
+	}
+	if apiPct > 0 {
+		windows = append(windows, newWindow("api", "API", apiPct, resetAt))
+	}
+	plan := ""
+	if windowLabel != "Usage" {
+		plan = titleCase(windowLabel)
+	}
+
 	return ProviderStatus{
-		ProviderID:     "cursor",
-		DisplayName:    "Cursor",
-		UsagePercent:   usagePct,
-		RemainingLabel: fmt.Sprintf("%.0f%% used", usagePct),
-		WindowLabel:    windowLabel,
-		ResetAt:        resetAt,
-		Severity:       severityForPercent(usagePct),
-		Health:         "ready",
-		DeepLink:       "https://cursor.com/dashboard",
-		SummaryValue:   fmt.Sprintf("%.0f%%", usagePct),
-		Details:        details,
-		Timestamp:      time.Now().UTC(),
+		Windows:         windows,
+		Plan:            plan,
+		AccountIdentity: accountDetail,
+		IdentityKey:     identityKey,
+		ProviderID:      "cursor",
+		DisplayName:     "Cursor",
+		UsagePercent:    usagePct,
+		RemainingLabel:  fmt.Sprintf("%.0f%% used", usagePct),
+		WindowLabel:     windowLabel,
+		ResetAt:         resetAt,
+		Severity:        severityForPercent(usagePct),
+		Health:          "ready",
+		DeepLink:        "https://cursor.com/dashboard",
+		SummaryValue:    fmt.Sprintf("%.0f%%", usagePct),
+		Details:         details,
+		Timestamp:       time.Now().UTC(),
 	}, nil
 }
 
@@ -1870,8 +1985,19 @@ func (p *commandCodeProvider) Fetch(ctx context.Context, auth AuthContext) (Prov
 		detailsParts = []string{fmt.Sprintf("$%.2f monthly remaining", credits.MonthlyCredits)}
 	}
 
+	var windows []usageWindow
+	var notes []string
+	if hasPlan {
+		used := max(0, min(plan.MonthlyCreditsUSD, plan.MonthlyCreditsUSD-credits.MonthlyCredits))
+		if w, ok := amountWindow("monthly", "Monthly credits", used, plan.MonthlyCreditsUSD, formatUSD, resetAt); ok {
+			windows = append(windows, w)
+		}
+	} else {
+		notes = append(notes, fmt.Sprintf("$%.2f monthly remaining", credits.MonthlyCredits))
+	}
 	if credits.PurchasedCredits > 0 {
 		detailsParts = append(detailsParts, fmt.Sprintf("$%.2f purchased", credits.PurchasedCredits))
+		notes = append(notes, fmt.Sprintf("$%.2f purchased", credits.PurchasedCredits))
 	}
 	if !resetAt.IsZero() {
 		detailsParts = append(detailsParts, fmt.Sprintf("resets in %s", durationUntil(resetAt)))
@@ -1891,6 +2017,9 @@ func (p *commandCodeProvider) Fetch(ctx context.Context, auth AuthContext) (Prov
 	}
 
 	return ProviderStatus{
+		Windows:        windows,
+		Plan:           planLabel,
+		Note:           strings.Join(notes, ", "),
 		ProviderID:     "commandcode",
 		DisplayName:    "Command Code",
 		UsagePercent:   usagePct,
@@ -2087,9 +2216,11 @@ func authToken(auth AuthContext) string {
 
 // --- Snapshot builder ---
 
+// effectiveDisplayName names a card in the menubar summary, alerts and
+// events: the provider name, plus the account label when one is set.
 func effectiveDisplayName(p ProviderStatus) string {
-	if p.AccountDisplayName != "" {
-		return p.DisplayName + " (" + p.AccountDisplayName + ")"
+	if p.AccountLabel != "" {
+		return p.DisplayName + " · " + p.AccountLabel
 	}
 	return p.DisplayName
 }
@@ -2099,18 +2230,19 @@ type fetchResult struct {
 	err    error
 }
 
-func (p *aiProviderPlugin) emitProviderEvents(results map[string]fetchResult) {
+func (p *aiProviderPlugin) emitProviderEvents(cards []ProviderStatus) {
 	warnThreshold := p.config.WarningThreshold
 	critThreshold := p.config.CriticalThreshold
 
-	for key, res := range results {
-		if res.status.Health != "ready" || res.err != nil {
+	for _, status := range cards {
+		if status.Health != "ready" {
 			continue
 		}
+		key := status.resultKey
 
-		currentPct := res.status.UsagePercent
+		currentPct := status.UsagePercent
 		prevPct, hadPrev := p.prevUsage[key]
-		displayName := effectiveDisplayName(res.status)
+		displayName := effectiveDisplayName(status)
 
 		if hadPrev {
 			if prevPct < critThreshold && currentPct >= critThreshold {
@@ -2118,14 +2250,14 @@ func (p *aiProviderPlugin) emitProviderEvents(results map[string]fetchResult) {
 					Type:     "usage.threshold_crossed",
 					Message:  fmt.Sprintf("%s usage crossed critical threshold (%.0f%%)", displayName, currentPct),
 					Severity: sdk.SeverityCritical,
-					Data:     map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "usagePercent": fmt.Sprintf("%.0f", currentPct), "threshold": "critical"},
+					Data:     map[string]string{"providerId": status.ProviderID, "accountId": status.AccountID, "usagePercent": fmt.Sprintf("%.0f", currentPct), "threshold": "critical"},
 				})
 			} else if prevPct < warnThreshold && currentPct >= warnThreshold && currentPct < critThreshold {
 				sdk.Emit(sdk.Event{
 					Type:     "usage.threshold_crossed",
 					Message:  fmt.Sprintf("%s usage crossed warning threshold (%.0f%%)", displayName, currentPct),
 					Severity: sdk.SeverityWarning,
-					Data:     map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "usagePercent": fmt.Sprintf("%.0f", currentPct), "threshold": "warning"},
+					Data:     map[string]string{"providerId": status.ProviderID, "accountId": status.AccountID, "usagePercent": fmt.Sprintf("%.0f", currentPct), "threshold": "warning"},
 				})
 			}
 
@@ -2134,7 +2266,7 @@ func (p *aiProviderPlugin) emitProviderEvents(results map[string]fetchResult) {
 					Type:     "usage.decreased",
 					Message:  fmt.Sprintf("%s usage dropped from %.0f%% to %.0f%%", displayName, prevPct, currentPct),
 					Severity: sdk.SeverityInfo,
-					Data:     map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "previous": fmt.Sprintf("%.0f", prevPct), "current": fmt.Sprintf("%.0f", currentPct)},
+					Data:     map[string]string{"providerId": status.ProviderID, "accountId": status.AccountID, "previous": fmt.Sprintf("%.0f", prevPct), "current": fmt.Sprintf("%.0f", currentPct)},
 				})
 			}
 
@@ -2143,7 +2275,7 @@ func (p *aiProviderPlugin) emitProviderEvents(results map[string]fetchResult) {
 					Type:     "usage.increased",
 					Message:  fmt.Sprintf("%s usage rose from %.0f%% to %.0f%%", displayName, prevPct, currentPct),
 					Severity: sdk.SeverityInfo,
-					Data:     map[string]string{"providerId": res.status.ProviderID, "accountId": res.status.AccountID, "previous": fmt.Sprintf("%.0f", prevPct), "current": fmt.Sprintf("%.0f", currentPct)},
+					Data:     map[string]string{"providerId": status.ProviderID, "accountId": status.AccountID, "previous": fmt.Sprintf("%.0f", prevPct), "current": fmt.Sprintf("%.0f", currentPct)},
 				})
 			}
 		}
@@ -2156,7 +2288,9 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 	if p.providers == nil {
 		p.providers = getAllProviders()
 	}
-	allProviders := p.providers
+	if p.prevUsage == nil {
+		p.prevUsage = make(map[string]float64)
+	}
 	enabledIDs := p.config.EnabledProviders
 
 	enabledSet := make(map[string]bool)
@@ -2169,77 +2303,52 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 	ctx, cancel := context.WithTimeout(context.Background(), 28*time.Second)
 	defer cancel()
 
-	// Fetch all enabled providers concurrently (one job per provider+account pair)
-	type providerJob struct {
-		provider Provider
-		auth     AuthContext
-		hasAuth  bool
-		key      string
-	}
-	jobs := make([]providerJob, 0)
-	for _, provider := range allProviders {
-		if !enabledSet[provider.ID()] {
-			continue
-		}
-		auths := p.authsForProvider(provider.ID())
-		if len(auths) == 0 {
-			jobs = append(jobs, providerJob{
-				provider,
-				AuthContext{},
-				!providerRequiresHostAuth(provider.ID()),
-				provider.ID(),
-			})
-		} else {
-			for i, auth := range auths {
-				key := provider.ID()
-				if auth.AccountID != "" {
-					key = key + ":" + auth.AccountID
-				} else {
-					key = key + ":" + strconv.Itoa(i)
-				}
-				hasAuth := !providerRequiresHostAuth(provider.ID()) || p.hasUsableAuth(auth)
-				jobs = append(jobs, providerJob{provider, auth, hasAuth, key})
-			}
-		}
-	}
+	// Fetch all enabled providers concurrently: one job per distinct effective
+	// credential (see planJobs).
+	jobs := p.planJobs(enabledSet)
 
-	resultCh := make(chan struct {
+	type jobResult struct {
 		id  string
 		res fetchResult
-	}, len(jobs))
+	}
+	resultCh := make(chan jobResult, len(jobs))
 
 	for _, job := range jobs {
 		go func(j providerJob) {
+			send := func(res fetchResult) {
+				res.status.resultKey = j.key
+				res.status.slot = j.slot
+				res.status.noSecret = j.noSecret
+				res.status.order = j.order
+				if res.status.AccountID == "" {
+					res.status.AccountID = j.auth.AccountID
+				}
+				if res.status.AccountDisplayName == "" {
+					res.status.AccountDisplayName = j.auth.DisplayName
+				}
+				if res.status.ProviderID == "" {
+					res.status.ProviderID = j.provider.ID()
+				}
+				if res.status.DisplayName == "" {
+					res.status.DisplayName = j.provider.DisplayName()
+				}
+				resultCh <- jobResult{j.key, res}
+			}
 			defer func() {
 				if r := recover(); r != nil {
 					fmt.Fprintf(os.Stderr, "[ai-provider-plugin] panic in provider %s goroutine: %v\n", j.provider.ID(), r)
-					resultCh <- struct {
-						id  string
-						res fetchResult
-					}{j.key, fetchResult{
+					send(fetchResult{
 						status: ProviderStatus{
-							ProviderID:  j.provider.ID(),
-							DisplayName: j.provider.DisplayName(),
-							Health:      "error",
-							Severity:    "info",
-							Details:     fmt.Sprintf("Internal error: %v", r),
+							Health:   "error",
+							Severity: "info",
+							Details:  fmt.Sprintf("Internal error: %v", r),
 						},
-					}}
+					})
 				}
 			}()
 			if !j.hasAuth {
 				sdk.Log("provider %s no auth, skipping fetch", j.key)
-				resultCh <- struct {
-					id  string
-					res fetchResult
-				}{j.key, fetchResult{
-					status: ProviderStatus{
-						ProviderID:  j.provider.ID(),
-						DisplayName: j.provider.DisplayName(),
-						Health:      "auth_required",
-						Severity:    "info",
-					},
-				}}
+				send(fetchResult{status: ProviderStatus{Health: "auth_required", Severity: "info"}})
 				return
 			}
 
@@ -2254,10 +2363,6 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 			done := make(chan fetchOutcome, 1)
 			go func() {
 				s, e := j.provider.Fetch(reqCtx, j.auth)
-				if e == nil {
-					s.AccountID = j.auth.AccountID
-					s.AccountDisplayName = j.auth.DisplayName
-				}
 				done <- fetchOutcome{s, e}
 			}()
 
@@ -2267,15 +2372,6 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 			case outcome := <-done:
 				status, err = outcome.status, outcome.err
 			case <-time.After(25 * time.Second):
-				status = ProviderStatus{
-					ProviderID:         j.provider.ID(),
-					DisplayName:        j.provider.DisplayName(),
-					AccountID:          j.auth.AccountID,
-					AccountDisplayName: j.auth.DisplayName,
-					Health:             "error",
-					Severity:           "info",
-					Details:            "Request timed out",
-				}
 				err = fmt.Errorf("fetch timed out after 25s")
 			}
 
@@ -2285,32 +2381,22 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 				if isRateLimitError(err) {
 					health = "rate_limited"
 				}
-				resultCh <- struct {
-					id  string
-					res fetchResult
-				}{j.key, fetchResult{
+				send(fetchResult{
 					status: ProviderStatus{
-						ProviderID:         j.provider.ID(),
-						DisplayName:        j.provider.DisplayName(),
-						AccountID:          j.auth.AccountID,
-						AccountDisplayName: j.auth.DisplayName,
-						Health:             health,
-						Severity:           "info",
-						Details:            sanitizeDetail(err.Error()),
-						Timestamp:          time.Now().UTC(),
+						Health:    health,
+						Severity:  "info",
+						Details:   sanitizeDetail(err.Error()),
+						Timestamp: time.Now().UTC(),
 					},
 					err: err,
-				}}
+				})
 				return
 			}
 			if status.Health == "ready" {
 				status.Severity = p.severityFor(status.UsagePercent)
 			}
 			sdk.Log("provider %s fetch done health=%s", j.key, status.Health)
-			resultCh <- struct {
-				id  string
-				res fetchResult
-			}{j.key, fetchResult{status: status}}
+			send(fetchResult{status: status})
 		}(job)
 	}
 
@@ -2320,9 +2406,6 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 		results[r.id] = r.res
 	}
 	sdk.Log("all provider results received")
-
-	// Emit events for threshold crosses and provider state changes
-	p.emitProviderEvents(results)
 
 	// If no providers enabled at all
 	if len(jobs) == 0 {
@@ -2342,12 +2425,19 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 		}
 	}
 
-	// Build items (cards) for all fetched provider+account pairs
+	// Build cards: collapse duplicate accounts, label, order.
 	cards := make([]ProviderStatus, 0, len(results))
-	var readyCount, authCount, rateLimitedCount, failedCount int
 	for _, res := range results {
 		cards = append(cards, res.status)
-		switch res.status.Health {
+	}
+	cards = p.finalizeCards(cards)
+
+	// Emit events for threshold crosses and provider state changes
+	p.emitProviderEvents(cards)
+
+	var readyCount, authCount, rateLimitedCount, failedCount int
+	for _, card := range cards {
+		switch card.Health {
 		case "ready":
 			readyCount++
 		case "auth_required":
@@ -2358,16 +2448,8 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 			failedCount++
 		}
 	}
-	// Stable card order (map iteration is random): provider priority, then key.
-	sort.SliceStable(cards, func(i, j int) bool {
-		pi, pj := providerPriority[cards[i].ProviderID], providerPriority[cards[j].ProviderID]
-		if pi != pj {
-			return pi < pj
-		}
-		return cards[i].AccountID < cards[j].AccountID
-	})
 	hasAnyLive := readyCount > 0
-	allAuthMissing := authCount == len(results)
+	allAuthMissing := authCount == len(cards)
 	allRateLimited := readyCount == 0 && failedCount == 0 && rateLimitedCount > 0
 	allErrored := readyCount == 0 && !allAuthMissing && !allRateLimited
 
@@ -2381,7 +2463,7 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 	var alerts = make([]sdk.Alert, 0)
 	items := make([]sdk.Item, 0, len(cards))
 
-	if allAuthMissing && len(jobs) > 0 {
+	if allAuthMissing {
 		summary = sdk.Summary{
 			Title: "AI Providers", Value: "AI auth", Trend: sdk.TrendSteady, Severity: sdk.SeverityInfo, IconHint: "brain.head.profile",
 		}
@@ -2399,7 +2481,7 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 		alerts = append(alerts, sdk.Alert{
 			ID: "ai-rate-limited", Severity: sdk.SeverityWarning, Message: "AI provider usage APIs are rate limiting requests. Retrying later.",
 		})
-	} else if allErrored && len(jobs) > 0 {
+	} else if allErrored {
 		summary = sdk.Summary{
 			Title: "AI Providers", Value: "AI unavailable", Trend: sdk.TrendSteady, Severity: sdk.SeverityWarning, IconHint: "brain.head.profile",
 		}
@@ -2443,15 +2525,15 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 		if card.Health == "ready" {
 			if card.Severity == "critical" {
 				alerts = append(alerts, sdk.Alert{
-					ID:       "ai-" + card.ProviderID + "-critical",
+					ID:       alertID(card, "critical"),
 					Severity: sdk.SeverityCritical,
-					Message:  fmt.Sprintf("%s usage is at %.0f%% (critical threshold)", card.DisplayName, card.UsagePercent),
+					Message:  fmt.Sprintf("%s usage is at %.0f%% (critical threshold)", effectiveDisplayName(card), card.UsagePercent),
 				})
 			} else if card.Severity == "warning" {
 				alerts = append(alerts, sdk.Alert{
-					ID:       "ai-" + card.ProviderID + "-warning",
+					ID:       alertID(card, "warning"),
 					Severity: sdk.SeverityWarning,
-					Message:  fmt.Sprintf("%s usage is at %.0f%% (warning threshold)", card.DisplayName, card.UsagePercent),
+					Message:  fmt.Sprintf("%s usage is at %.0f%% (warning threshold)", effectiveDisplayName(card), card.UsagePercent),
 				})
 			}
 		}
@@ -2473,6 +2555,21 @@ func (p *aiProviderPlugin) buildSnapshot() sdk.Snapshot {
 
 	p.lastSnapshot = &snapshot
 	return snapshot
+}
+
+// cardSlot is the per-account suffix for item and alert IDs.
+func cardSlot(p ProviderStatus) string {
+	if p.slot != "" {
+		return p.slot
+	}
+	return p.AccountID
+}
+
+func alertID(p ProviderStatus, level string) string {
+	if slot := cardSlot(p); slot != "" {
+		return "ai-" + p.ProviderID + "-" + slot + "-" + level
+	}
+	return "ai-" + p.ProviderID + "-" + level
 }
 
 func itemTimestamp(t time.Time) string {
@@ -2505,7 +2602,7 @@ func selectWinner(cards []ProviderStatus) providerWithData {
 	// 2. Highest UsagePercent
 	// 3. Earliest ResetAt
 	// 4. Stable provider priority
-	sort.Slice(live, func(i, j int) bool {
+	sort.SliceStable(live, func(i, j int) bool {
 		a, b := live[i], live[j]
 
 		// Rule 1: Critical severity wins
@@ -2537,6 +2634,16 @@ func selectWinner(cards []ProviderStatus) providerWithData {
 	return providerWithData{ProviderStatus: live[0], HasData: true}
 }
 
+func joinNonEmpty(sep string, parts ...string) string {
+	kept := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			kept = append(kept, part)
+		}
+	}
+	return strings.Join(kept, sep)
+}
+
 func cardToItem(p ProviderStatus) sdk.Item {
 	severity := validSeverity(p.Severity)
 	switch p.Health {
@@ -2546,46 +2653,68 @@ func cardToItem(p ProviderStatus) sdk.Item {
 		severity = sdk.SeverityWarning
 	}
 
-	var title string
+	title := p.DisplayName
+	label := p.AccountLabel
 	var subtitle string
 	var detail string
+	var gauges []sdk.Gauge
 
-	displayTitle := effectiveDisplayName(p)
-	actionLabel := "Open " + displayTitle
+	// withLabel prefixes a state word with the account label when known.
+	withLabel := func(stateText string) string {
+		return joinNonEmpty(" · ", label, stateText)
+	}
 
 	switch p.Health {
 	case "ready":
-		title = displayTitle
-		subtitle = p.WindowLabel
-		detail = p.Details
+		if len(p.Windows) > 0 {
+			gauges = make([]sdk.Gauge, 0, len(p.Windows))
+			for _, w := range p.Windows {
+				gauges = append(gauges, w.gauge())
+			}
+		}
+		switch {
+		case label != "":
+			subtitle = label
+		case len(gauges) > 0 && p.Plan != "":
+			subtitle = p.Plan
+		default:
+			subtitle = p.WindowLabel
+		}
+		if len(gauges) > 0 {
+			plan := p.Plan
+			if subtitle == plan {
+				plan = ""
+			}
+			detail = joinNonEmpty(" · ", plan, p.Note)
+		} else {
+			detail = p.Details
+		}
 	case "auth_required":
-		title = displayTitle
-		subtitle = "Auth required"
+		subtitle = withLabel("Auth required")
 		detail = "Set up credentials in Settings"
 		if strings.TrimSpace(p.Details) != "" {
 			detail = sanitizeDetail(p.Details)
 		}
 	case "rate_limited":
-		title = displayTitle
-		subtitle = "Rate limited"
+		subtitle = withLabel("Rate limited")
 		detail = sanitizeDetail(p.Details)
 	case "error":
-		title = displayTitle
-		subtitle = "Error"
+		subtitle = withLabel("Error")
 		detail = sanitizeDetail(p.Details)
 	case "degraded":
-		title = displayTitle
-		subtitle = p.WindowLabel
+		subtitle = label
+		if subtitle == "" {
+			subtitle = p.WindowLabel
+		}
 		detail = sanitizeDetail(p.Details)
 	default:
-		title = displayTitle
-		subtitle = "Unknown"
+		subtitle = withLabel("Unknown")
 		detail = sanitizeDetail(p.Details)
 	}
 
 	itemID := "ai-provider-" + p.ProviderID
-	if p.AccountID != "" {
-		itemID = itemID + "-" + p.AccountID
+	if slot := cardSlot(p); slot != "" {
+		itemID = itemID + "-" + slot
 	}
 
 	return sdk.Item{
@@ -2596,10 +2725,13 @@ func cardToItem(p ProviderStatus) sdk.Item {
 		Severity:  severity,
 		Timestamp: itemTimestamp(p.Timestamp),
 		DeepLink:  p.DeepLink,
-		Actions:   []sdk.Action{{ID: "open_" + p.ProviderID, Label: actionLabel}},
+		Actions:   []sdk.Action{{ID: "open_" + p.ProviderID, Label: "Open " + p.DisplayName}},
+		Gauges:    gauges,
 		Metadata: map[string]string{
 			"providerId":   p.ProviderID,
 			"displayName":  p.DisplayName,
+			"accountId":    p.AccountID,
+			"accountLabel": p.AccountLabel,
 			"usagePercent": fmt.Sprintf("%.2f", p.UsagePercent),
 			"windowLabel":  p.WindowLabel,
 			"severity":     p.Severity,

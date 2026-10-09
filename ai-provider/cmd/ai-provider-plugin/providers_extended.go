@@ -295,6 +295,7 @@ func (p *geminiProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderS
 		details += ", resets in " + durationUntil(resetAt)
 	}
 	return ProviderStatus{
+		Windows:        []usageWindow{newWindow("quota", "Model quota", usagePct, resetAt)},
 		ProviderID:     "gemini",
 		DisplayName:    "Gemini",
 		UsagePercent:   usagePct,
@@ -460,6 +461,12 @@ func (p *windsurfProvider) Fetch(ctx context.Context, auth AuthContext) (Provide
 		details += ", resets in " + durationUntil(resetAt)
 	}
 	return ProviderStatus{
+		Windows: []usageWindow{
+			newWindow("daily", "Daily", dailyUsed, status.DailyResetAt),
+			newWindow("weekly", "Weekly", weeklyUsed, status.WeeklyResetAt),
+		},
+		Plan:           strings.TrimSpace(status.PlanName),
+		IdentityKey:    "account:" + session.AccountID,
 		ProviderID:     "windsurf",
 		DisplayName:    "Windsurf",
 		UsagePercent:   usagePct,
@@ -556,6 +563,7 @@ func (p *grokProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderSta
 		details += ", resets in " + durationUntil(snapshot.ResetAt)
 	}
 	return ProviderStatus{
+		Windows:        []usageWindow{newWindow("credits", "Credits", snapshot.UsedPercent, snapshot.ResetAt)},
 		ProviderID:     "grok",
 		DisplayName:    "Grok",
 		UsagePercent:   snapshot.UsedPercent,
@@ -653,7 +661,17 @@ func (p *augmentProvider) Fetch(ctx context.Context, auth AuthContext) (Provider
 	if !resetAt.IsZero() {
 		details += ", resets in " + durationUntil(resetAt)
 	}
+	var windows []usageWindow
+	if w, ok := amountWindow("credits", "Credits", used, limit, formatCount, resetAt); ok {
+		windows = append(windows, w)
+	}
+	plan := ""
+	if planName != "Augment" {
+		plan = planName
+	}
 	return ProviderStatus{
+		Windows:        windows,
+		Plan:           plan,
 		ProviderID:     "augment",
 		DisplayName:    "Augment",
 		UsagePercent:   usagePct,
@@ -750,6 +768,7 @@ func (p *factoryProvider) Fetch(ctx context.Context, auth AuthContext) (Provider
 		return ProviderStatus{}, err
 	}
 	return ProviderStatus{
+		Windows:        []usageWindow{newWindow("usage", windowLabel, usagePct, resetAt)},
 		ProviderID:     "factory",
 		DisplayName:    "Factory",
 		UsagePercent:   usagePct,
@@ -880,20 +899,66 @@ func (p *zedProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderStat
 	if err != nil {
 		return ProviderStatus{}, err
 	}
+	used, limit, login := zedParseCounts(body)
+	var windows []usageWindow
+	if w, ok := amountWindow("edit-predictions", "Edit predictions", used, limit, formatCount, resetAt); ok {
+		windows = append(windows, w)
+	}
+	plan := ""
+	if planName != "Zed" {
+		plan = planName
+	}
+	identityKey := ""
+	if login != "" {
+		identityKey = "login:" + strings.ToLower(login)
+	}
 	return ProviderStatus{
-		ProviderID:     "zed",
-		DisplayName:    "Zed",
-		UsagePercent:   usagePct,
-		RemainingLabel: details,
-		WindowLabel:    planName,
-		ResetAt:        resetAt,
-		Severity:       severityForPercent(usagePct),
-		Health:         "ready",
-		DeepLink:       "https://zed.dev",
-		SummaryValue:   fmt.Sprintf("%.0f%%", usagePct),
-		Details:        details,
-		Timestamp:      time.Now().UTC(),
+		Windows:         windows,
+		Plan:            plan,
+		AccountIdentity: login,
+		IdentityKey:     identityKey,
+		ProviderID:      "zed",
+		DisplayName:     "Zed",
+		UsagePercent:    usagePct,
+		RemainingLabel:  details,
+		WindowLabel:     planName,
+		ResetAt:         resetAt,
+		Severity:        severityForPercent(usagePct),
+		Health:          "ready",
+		DeepLink:        "https://zed.dev",
+		SummaryValue:    fmt.Sprintf("%.0f%%", usagePct),
+		Details:         details,
+		Timestamp:       time.Now().UTC(),
 	}, nil
+}
+
+// zedParseCounts extracts the edit-prediction counts and, when present, the
+// account's GitHub login (field names inferred from Zed's /client/users/me).
+func zedParseCounts(body []byte) (used, limit float64, login string) {
+	var parsed struct {
+		User *struct {
+			GithubLogin string `json:"github_login"`
+			Name        string `json:"name"`
+		} `json:"user"`
+		Plan struct {
+			Usage struct {
+				EditPredictions struct {
+					Used  float64 `json:"used"`
+					Limit float64 `json:"limit"`
+				} `json:"editPredictions"`
+			} `json:"usage"`
+		} `json:"plan"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return 0, 0, ""
+	}
+	if parsed.User != nil {
+		login = strings.TrimSpace(parsed.User.GithubLogin)
+		if login == "" {
+			login = strings.TrimSpace(parsed.User.Name)
+		}
+	}
+	return parsed.Plan.Usage.EditPredictions.Used, parsed.Plan.Usage.EditPredictions.Limit, login
 }
 
 func zedParseUsage(body []byte) (float64, time.Time, string, string, error) {
@@ -978,7 +1043,12 @@ func (p *warpProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderSta
 	if err != nil {
 		return ProviderStatus{}, err
 	}
+	var windows []usageWindow
+	if details != "Unlimited" {
+		windows = append(windows, newWindow("requests", "Request credits", usagePct, resetAt))
+	}
 	return ProviderStatus{
+		Windows:        windows,
 		ProviderID:     "warp",
 		DisplayName:    "Warp",
 		UsagePercent:   usagePct,
@@ -1156,6 +1226,11 @@ func (p *devinProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderSt
 			details = planName + " · " + details
 		}
 		return ProviderStatus{
+			Windows: []usageWindow{
+				newWindow("daily", "Daily", daily, time.Time{}),
+				newWindow("weekly", "Weekly", weekly, time.Time{}),
+			},
+			Plan:           planName,
 			ProviderID:     "devin",
 			DisplayName:    "Devin",
 			UsagePercent:   usagePct,
@@ -1324,6 +1399,7 @@ func (p *kiroProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderSta
 	usagePct, _ := strconv.ParseFloat(match[1], 64)
 	usagePct = min(100, usagePct)
 	return ProviderStatus{
+		Windows:        []usageWindow{newWindow("credits", "Credits", usagePct, time.Time{})},
 		ProviderID:     "kiro",
 		DisplayName:    "Kiro",
 		UsagePercent:   usagePct,

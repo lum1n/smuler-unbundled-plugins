@@ -59,10 +59,16 @@ const (
 	// Used when the installed Claude Code version can't be detected.
 	claudeFallbackCLIVersion = "2.1.80"
 	claudeExpirySkew         = 60 * time.Second
+
+	claudeDefaultProfileURL    = "https://api.anthropic.com/api/oauth/profile"
+	claudeProfileTimeout       = 5 * time.Second
+	claudeProfileRetryInterval = time.Hour
 )
 
 var (
 	claudeUsageURL = claudeDefaultUsageURL
+	// claudeProfileURL is the account profile endpoint; "" disables lookups.
+	claudeProfileURL = claudeDefaultProfileURL
 	// claudeUserAgentOnce resolves the User-Agent lazily (after initialize has
 	// set claudeHomeDir, which the version probe needs to find the binary).
 	claudeUserAgentOnce  sync.Once
@@ -245,19 +251,21 @@ func parseClaudeUsage(body []byte, plan string, now time.Time) (ProviderStatus, 
 		return ProviderStatus{}, fmt.Errorf("Claude parse error: %w", err)
 	}
 	type window struct {
-		label   string
+		id      string
+		label   string // gauge label
+		short   string // text summary label
 		pct     float64
 		resetAt time.Time
 	}
 	var windows []window
 	for _, w := range []struct {
-		label string
-		data  *claudeUsageWindow
+		id, label, short string
+		data             *claudeUsageWindow
 	}{
-		{"Session", usage.FiveHour},
-		{"Weekly", usage.SevenDay},
-		{"Opus weekly", usage.SevenDayOpus},
-		{"Sonnet weekly", usage.SevenDaySonnet},
+		{"session", "Session", "Session", usage.FiveHour},
+		{"weekly", "Weekly", "Weekly", usage.SevenDay},
+		{"weekly-opus", "Weekly · Opus", "Opus weekly", usage.SevenDayOpus},
+		{"weekly-sonnet", "Weekly · Sonnet", "Sonnet weekly", usage.SevenDaySonnet},
 	} {
 		if w.data == nil || w.data.Utilization == nil {
 			continue
@@ -266,7 +274,7 @@ func parseClaudeUsage(body []byte, plan string, now time.Time) (ProviderStatus, 
 		if w.data.ResetsAt != nil {
 			resetAt = parseFlexibleTime(*w.data.ResetsAt)
 		}
-		windows = append(windows, window{w.label, max(0, min(100, *w.data.Utilization)), resetAt})
+		windows = append(windows, window{w.id, w.label, w.short, clampPercent(*w.data.Utilization), resetAt})
 	}
 	if len(windows) == 0 {
 		return ProviderStatus{}, fmt.Errorf("Claude usage response had no usage windows")
@@ -274,20 +282,24 @@ func parseClaudeUsage(body []byte, plan string, now time.Time) (ProviderStatus, 
 
 	primary := windows[0]
 	parts := make([]string, 0, len(windows))
+	gauges := make([]usageWindow, 0, len(windows))
 	for _, w := range windows {
 		if w.pct > primary.pct {
 			primary = w
 		}
-		parts = append(parts, fmt.Sprintf("%s %.0f%%", w.label, w.pct))
+		parts = append(parts, fmt.Sprintf("%s %.0f%%", w.short, w.pct))
+		gauges = append(gauges, newWindow(w.id, w.label, w.pct, w.resetAt))
 	}
 	summary := strings.Join(parts, " · ")
 	details := summary
 	if !primary.resetAt.IsZero() {
 		details += ", resets in " + durationUntil(primary.resetAt)
 	}
-	windowLabel := primary.label + " usage"
+	windowLabel := primary.short + " usage"
+	planLabel := ""
 	if plan != "" {
-		windowLabel = titleCase(plan) + " · " + windowLabel
+		planLabel = titleCase(plan)
+		windowLabel = planLabel + " · " + windowLabel
 	}
 	return ProviderStatus{
 		ProviderID:     "claude",
@@ -302,7 +314,133 @@ func parseClaudeUsage(body []byte, plan string, now time.Time) (ProviderStatus, 
 		SummaryValue:   fmt.Sprintf("%.0f%%", primary.pct),
 		Details:        details,
 		Timestamp:      now.UTC(),
+		Plan:           planLabel,
+		Windows:        gauges,
 	}, nil
+}
+
+// --- Account profile (label + identity) ---
+
+// claudeProfileResponse mirrors GET /api/oauth/profile (the endpoint Claude
+// Code uses for /status). Only the fields we need; all optional.
+type claudeProfileResponse struct {
+	Account *struct {
+		UUID        string `json:"uuid"`
+		Email       string `json:"email"`
+		EmailAlt    string `json:"email_address"`
+		DisplayName string `json:"display_name"`
+		FullName    string `json:"full_name"`
+	} `json:"account"`
+	Organization *struct {
+		UUID string `json:"uuid"`
+		Name string `json:"name"`
+	} `json:"organization"`
+}
+
+type claudeProfile struct {
+	label       string
+	identityKey string
+	fetched     bool
+	failedAt    time.Time
+}
+
+func parseClaudeProfile(body []byte) (claudeProfile, bool) {
+	var resp claudeProfileResponse
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Account == nil {
+		return claudeProfile{}, false
+	}
+	a := resp.Account
+	email := strings.TrimSpace(a.Email)
+	if email == "" {
+		email = strings.TrimSpace(a.EmailAlt)
+	}
+	label := email
+	for _, candidate := range []string{a.DisplayName, a.FullName} {
+		if label == "" {
+			label = strings.TrimSpace(candidate)
+		}
+	}
+	if label == "" && resp.Organization != nil {
+		label = strings.TrimSpace(resp.Organization.Name)
+	}
+	key := ""
+	switch {
+	case strings.TrimSpace(a.UUID) != "":
+		key = "uuid:" + strings.TrimSpace(a.UUID)
+	case email != "":
+		key = "email:" + strings.ToLower(email)
+	}
+	if label == "" && key == "" {
+		return claudeProfile{}, false
+	}
+	return claudeProfile{label: label, identityKey: key, fetched: true}, true
+}
+
+func claudeFetchProfile(ctx context.Context, token string) (claudeHTTPResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, claudeProfileTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, claudeProfileURL, nil)
+	if err != nil {
+		return claudeHTTPResult{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("anthropic-beta", claudeOAuthBetaHeader)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", claudeUserAgent())
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return claudeHTTPResult{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return claudeHTTPResult{}, err
+	}
+	return claudeHTTPResult{status: resp.StatusCode, body: body}, nil
+}
+
+// profileFor returns the cached account profile for a token, fetching it at
+// most once per token (failures retry after claudeProfileRetryInterval).
+// Must be called with p.mu held.
+func (p *claudeProvider) profileFor(ctx context.Context, token string, now time.Time) claudeProfile {
+	if claudeProfileURL == "" {
+		return claudeProfile{}
+	}
+	if p.profiles == nil {
+		p.profiles = make(map[string]*claudeProfile)
+	}
+	fp := credentialFingerprint(token)
+	entry, ok := p.profiles[fp]
+	if ok && (entry.fetched || now.Sub(entry.failedAt) < claudeProfileRetryInterval) {
+		return *entry
+	}
+	res, err := claudeFetchProfile(ctx, token)
+	if err == nil && res.status == http.StatusOK {
+		if profile, ok := parseClaudeProfile(res.body); ok {
+			p.profiles[fp] = &profile
+			return profile
+		}
+	}
+	p.profiles[fp] = &claudeProfile{failedAt: now}
+	return claudeProfile{}
+}
+
+// knownLocalToken returns the cached local Claude Code access token, if any,
+// without touching disk or the Keychain. It never blocks on an in-flight
+// fetch.
+func (p *claudeProvider) knownLocalToken() string {
+	if !p.mu.TryLock() {
+		return ""
+	}
+	defer p.mu.Unlock()
+	now := p.clock()
+	for _, st := range p.states {
+		if st.localCreds != nil && !st.localCreds.expired(now) {
+			return st.localCreds.AccessToken
+		}
+	}
+	return ""
 }
 
 // --- Provider with per-account cache/backoff state ---
@@ -319,9 +457,10 @@ type claudeAccountState struct {
 }
 
 type claudeProvider struct {
-	mu     sync.Mutex
-	states map[string]*claudeAccountState
-	now    func() time.Time
+	mu       sync.Mutex
+	states   map[string]*claudeAccountState
+	profiles map[string]*claudeProfile // keyed by token fingerprint
+	now      func() time.Time
 }
 
 func (p *claudeProvider) ID() string          { return "claude" }
@@ -604,6 +743,10 @@ func (p *claudeProvider) Fetch(ctx context.Context, auth AuthContext) (ProviderS
 		if err != nil {
 			return ProviderStatus{}, err
 		}
+		status.CredentialKey = credentialFingerprint(creds.AccessToken)
+		profile := p.profileFor(ctx, creds.AccessToken, now)
+		status.AccountIdentity = profile.label
+		status.IdentityKey = profile.identityKey
 		st.lastGood = &status
 		st.lastGoodAt = now
 		st.backoffUntil = time.Time{}
@@ -639,6 +782,8 @@ func (p *claudeProvider) rateLimitedStatus(st *claudeAccountState, now time.Time
 		stale := *st.lastGood
 		stale.Details = fmt.Sprintf("%s (rate limited, last updated %s ago; retry in %s)",
 			st.lastGood.Details, durationSince(st.lastGoodAt, now), wait)
+		stale.Note = fmt.Sprintf("Rate limited, last updated %s ago; retry in %s",
+			durationSince(st.lastGoodAt, now), wait)
 		return stale
 	}
 	return claudeStatus("rate_limited", "Claude usage API rate limited. Retrying in "+wait+".", now)
