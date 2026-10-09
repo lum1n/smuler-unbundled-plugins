@@ -79,6 +79,22 @@ type Item struct {
 	DeepLink  string            `json:"deepLink,omitempty"`
 	Actions   []Action          `json:"actions"`
 	Metadata  map[string]string `json:"metadata,omitempty"`
+	// Gauges are optional usage meters the host renders as bars.
+	Gauges []Gauge `json:"gauges,omitempty"`
+}
+
+// Gauge is a usage meter on an item, rendered by the host as a bar.
+// Value is the used fraction in 0..1 (the host clamps out-of-range values).
+// ValueLabel replaces the default "NN%" text; Caption is secondary text such as
+// "resets in 2h 10m"; Severity (info|warning|critical) overrides the host's
+// threshold-based color.
+type Gauge struct {
+	ID         string  `json:"id,omitempty"`
+	Label      string  `json:"label"`
+	Value      float64 `json:"value"`
+	ValueLabel string  `json:"valueLabel,omitempty"`
+	Caption    string  `json:"caption,omitempty"`
+	Severity   string  `json:"severity,omitempty"`
 }
 
 // Action is a button / deep-link the user can activate.
